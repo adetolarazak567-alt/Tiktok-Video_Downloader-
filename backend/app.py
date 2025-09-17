@@ -1,5 +1,4 @@
-import re
-import json
+import os
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -13,47 +12,28 @@ def download_video():
     url = data.get("url")
 
     if not url:
-        return jsonify({"success": False, "message": "No URL provided."})
+        return jsonify({"success": False, "message": "No URL provided."}), 400
 
     try:
-        # Fetch TikTok page
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-        }
-        resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            return jsonify({"success": False, "message": "Failed to fetch TikTok page."})
+        # Use TikWM API (stable, free, no key needed)
+        api_url = "https://www.tikwm.com/api/"
+        res = requests.post(api_url, json={"url": url}, headers={"Content-Type": "application/json"})
 
-        html = resp.text
+        if res.status_code != 200:
+            return jsonify({"success": False, "message": "TikWM API error"}), 500
 
-        # Extract SIGI_STATE JSON (TikTok’s embedded data)
-        match = re.search(r'<script id="SIGI_STATE"[^>]*>(.*?)</script>', html)
-        if not match:
-            return jsonify({"success": False, "message": "Video data not found."})
+        result = res.json()
 
-        sigi_state = json.loads(match.group(1))
+        if result.get("data") and result["data"].get("play"):
+            video_url = result["data"]["play"]
+            return jsonify({"success": True, "url": video_url})
 
-        # Find video info
-        if "ItemModule" not in sigi_state or not sigi_state["ItemModule"]:
-            return jsonify({"success": False, "message": "No video info available."})
-
-        first_key = next(iter(sigi_state["ItemModule"]))
-        video_data = sigi_state["ItemModule"][first_key]["video"]
-
-        # Video URLs
-        video_url = video_data.get("playAddr")  # With watermark
-        no_watermark = video_data.get("downloadAddr")  # Usually no watermark
-
-        return jsonify({
-            "success": True,
-            "url": no_watermark or video_url,
-            "watermark": video_url,
-            "no_watermark": no_watermark
-        })
+        return jsonify({"success": False, "message": "Invalid response from TikWM."}), 500
 
     except Exception as e:
-        return jsonify({"success": False, "message": str(e)})
+        return jsonify({"success": False, "message": str(e)}), 500
 
 
 if __name__ == "__main__":
+    # For local testing
     app.run(host="0.0.0.0", port=5000, threaded=True)
