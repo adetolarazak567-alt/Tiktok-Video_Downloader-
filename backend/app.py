@@ -1,4 +1,5 @@
-import os
+import re
+import json
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -15,20 +16,40 @@ def download_video():
         return jsonify({"success": False, "message": "No URL provided."})
 
     try:
-        # Call tikwm API (reliable TikTok downloader)
-        api_url = "https://www.tikwm.com/api/"
-        res = requests.post(api_url, json={"url": url}, headers={"Content-Type": "application/json"})
+        # Fetch TikTok page
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        }
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return jsonify({"success": False, "message": "Failed to fetch TikTok page."})
 
-        if res.status_code != 200:
-            return jsonify({"success": False, "message": "TikTok API failed."})
+        html = resp.text
 
-        result = res.json()
+        # Extract SIGI_STATE JSON (TikTok’s embedded data)
+        match = re.search(r'<script id="SIGI_STATE"[^>]*>(.*?)</script>', html)
+        if not match:
+            return jsonify({"success": False, "message": "Video data not found."})
 
-        if result.get("data") and result["data"].get("play"):
-            video_url = result["data"]["play"]  # Direct video link
-            return jsonify({"success": True, "url": video_url})
+        sigi_state = json.loads(match.group(1))
 
-        return jsonify({"success": False, "message": "Invalid TikTok response."})
+        # Find video info
+        if "ItemModule" not in sigi_state or not sigi_state["ItemModule"]:
+            return jsonify({"success": False, "message": "No video info available."})
+
+        first_key = next(iter(sigi_state["ItemModule"]))
+        video_data = sigi_state["ItemModule"][first_key]["video"]
+
+        # Video URLs
+        video_url = video_data.get("playAddr")  # With watermark
+        no_watermark = video_data.get("downloadAddr")  # Usually no watermark
+
+        return jsonify({
+            "success": True,
+            "url": no_watermark or video_url,
+            "watermark": video_url,
+            "no_watermark": no_watermark
+        })
 
     except Exception as e:
         return jsonify({"success": False, "message": str(e)})
