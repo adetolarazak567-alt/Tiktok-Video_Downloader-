@@ -48,33 +48,55 @@ def download_video():
 
         return jsonify({"success": True, "url": cache[url]})
 
-try:
     try:
-        res = session.post(
-            "https://www.tikwm.com/api/",
-            json={"url": url},
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Accept": "application/json",
-                "Content-Type": "application/json"
-            },
-            timeout=30
-        )
-    except requests.exceptions.Timeout:
-        # retry once
-        res = session.post(
-            "https://www.tikwm.com/api/",
-            json={"url": url},
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Accept": "application/json",
-                "Content-Type": "application/json"
-            },
-            timeout=30
-        )
+        try:
+            res = session.post(
+                "https://www.tikwm.com/api/",
+                json={"url": url},
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                },
+                timeout=30
+            )
+        except requests.exceptions.Timeout:
+            # retry once
+            res = session.post(
+                "https://www.tikwm.com/api/",
+                json={"url": url},
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                },
+                timeout=30
+            )
+
         if res.status_code != 200:
             return jsonify({"success": False, "message": "API error"}), 500
 
+        data = res.json()
+
+        if data.get("data") and data["data"].get("play"):
+            video_url = data["data"]["play"]
+
+            cache[url] = video_url
+            stats["downloads"] += 1
+            stats["videos_served"] += 1
+
+            stats["download_logs"].append({
+                "ip": ip,
+                "url": url,
+                "timestamp": int(time.time())
+            })
+
+            return jsonify({"success": True, "url": video_url})
+
+        return jsonify({"success": False, "message": "Invalid response"}), 500
+
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
         data = res.json()
 
         if data.get("data") and data["data"].get("play"):
