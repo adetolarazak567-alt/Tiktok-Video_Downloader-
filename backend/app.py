@@ -48,13 +48,30 @@ def download_video():
 
         return jsonify({"success": True, "url": cache[url]})
 
+try:
     try:
         res = session.post(
             "https://www.tikwm.com/api/",
             json={"url": url},
-            timeout=10
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+                "Content-Type": "application/json"
+            },
+            timeout=30
         )
-
+    except requests.exceptions.Timeout:
+        # retry once
+        res = session.post(
+            "https://www.tikwm.com/api/",
+            json={"url": url},
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+                "Content-Type": "application/json"
+            },
+            timeout=30
+        )
         if res.status_code != 200:
             return jsonify({"success": False, "message": "API error"}), 500
 
