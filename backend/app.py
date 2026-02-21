@@ -1,5 +1,7 @@
 import time
 import requests
+import random
+import string
 import re
 import sqlite3
 from flask import Flask, request, jsonify, Response
@@ -10,67 +12,56 @@ CORS(app)
 
 session = requests.Session()
 
-# ===== SQLITE SETUP =====
-conn = sqlite3.connect("toolifyx.db", check_same_thread=False)
-cursor = conn.cursor()
+# ====== SQLITE DATABASE SETUP ======
+conn = sqlite3.connect("stats.db", check_same_thread=False)
+c = conn.cursor()
 
-# Create tables if not exist
-cursor.execute("""
+# Create stats table
+c.execute('''
 CREATE TABLE IF NOT EXISTS stats (
-    id INTEGER PRIMARY KEY,
-    requests INTEGER DEFAULT 0,
-    downloads INTEGER DEFAULT 0,
-    cache_hits INTEGER DEFAULT 0,
-    videos_served INTEGER DEFAULT 0
+    key TEXT PRIMARY KEY,
+    value INTEGER
 )
-""")
+''')
+# Initialize stats if not exists
+for key in ["requests", "downloads", "cache_hits", "videos_served"]:
+    c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES (?, ?)", (key, 0))
+conn.commit()
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS logs (
+# Table for unique IPs
+c.execute('''
+CREATE TABLE IF NOT EXISTS unique_ips (
+    ip TEXT PRIMARY KEY
+)
+''')
+
+# Table for download logs
+c.execute('''
+CREATE TABLE IF NOT EXISTS download_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ip TEXT,
     url TEXT,
     timestamp INTEGER
 )
-""")
+''')
+conn.commit()
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS cache (
-    url TEXT PRIMARY KEY,
-    video_url TEXT,
-    title TEXT
-)
-""")
+# ====== CACHE STORAGE ======
+cache = {}  # url -> video_url (still in-memory for speed)
 
-# Ensure stats row exists
-cursor.execute("SELECT id FROM stats WHERE id=1")
-if not cursor.fetchone():
-    cursor.execute("""
-    INSERT INTO stats (id, requests, downloads, cache_hits, videos_served)
-    VALUES (1,0,0,0,0)
-    """)
-    conn.commit()
-
-
-# ===== CLEAN FILENAME =====
+# ====== FILENAME CLEANING ======
 def clean_filename(text):
-    text = re.sub(r'[\\/*?:"<>|]', "", text)
+    text = re.sub(r'[\\/*?:"<>|]', "", text)  # remove invalid characters
     text = re.sub(r'\s+', " ", text).strip()
-    return text[:120]
+    return text[:120]  # limit length
 
+# ====== RANDOM STRING ======
+def random_string(length=6):
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
-# ===== UPDATE STAT FUNCTION =====
-def increment_stat(field):
-    cursor.execute(f"UPDATE stats SET {field} = {field} + 1 WHERE id=1")
-    conn.commit()
-
-
-# ===== DOWNLOAD API =====
+# ====== DOWNLOAD API ======
 @app.route("/download", methods=["POST"])
 def download_video():
-
-    increment_stat("requests")
-
     data = request.get_json()
     url = data.get("url")
     ip = request.remote_addr
@@ -78,36 +69,36 @@ def download_video():
     if not url:
         return jsonify({"success": False, "message": "No URL"}), 400
 
-    # ===== CACHE CHECK (SQLITE) =====
-    cursor.execute("SELECT video_url, title FROM cache WHERE url=?", (url,))
-    cached = cursor.fetchone()
+    # increment requests
+    c.execute("UPDATE stats SET value = value + 1 WHERE key = 'requests'")
 
-    if cached:
+    # add unique IP
+    c.execute("INSERT OR IGNORE INTO unique_ips (ip) VALUES (?)", (ip,))
+    conn.commit()
 
-        increment_stat("cache_hits")
-        increment_stat("downloads")
-        increment_stat("videos_served")
+    # ===== CACHE HIT =====
+    if url in cache:
+        c.execute("UPDATE stats SET value = value + 1 WHERE key = 'cache_hits'")
+        c.execute("UPDATE stats SET value = value + 1 WHERE key = 'downloads'")
+        c.execute("UPDATE stats SET value = value + 1 WHERE key = 'videos_served'")
+        conn.commit()
 
-        cursor.execute(
-            "INSERT INTO logs (ip, url, timestamp) VALUES (?,?,?)",
+        # log download
+        c.execute(
+            "INSERT INTO download_logs (ip, url, timestamp) VALUES (?, ?, ?)",
             (ip, url, int(time.time()))
         )
         conn.commit()
 
-        return jsonify({
-            "success": True,
-            "url": cached[0],
-            "title": cached[1]
-        })
+        return jsonify({"success": True, "url": cache[url]})
 
-    # ===== FETCH FROM TIKWM =====
     try:
-
         res = session.post(
             "https://www.tikwm.com/api/",
             json={"url": url},
             headers={
                 "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
                 "Content-Type": "application/json"
             },
             timeout=30
@@ -118,61 +109,51 @@ def download_video():
 
         result = res.json()
 
-        if result.get("data"):
-
+        if result.get("data") and result["data"].get("play"):
             video_url = result["data"]["play"]
-            title = clean_filename(result["data"].get("title") or "TikTok Video")
 
-            # Save cache permanently
-            cursor.execute(
-                "INSERT OR REPLACE INTO cache (url, video_url, title) VALUES (?,?,?)",
-                (url, video_url, title)
-            )
+            # store in cache
+            cache[url] = video_url
 
-            increment_stat("downloads")
-            increment_stat("videos_served")
-
-            cursor.execute(
-                "INSERT INTO logs (ip, url, timestamp) VALUES (?,?,?)",
+            # increment stats
+            c.execute("UPDATE stats SET value = value + 1 WHERE key = 'downloads'")
+            c.execute("UPDATE stats SET value = value + 1 WHERE key = 'videos_served'")
+            # log download
+            c.execute(
+                "INSERT INTO download_logs (ip, url, timestamp) VALUES (?, ?, ?)",
                 (ip, url, int(time.time()))
             )
-
             conn.commit()
 
-            return jsonify({
-                "success": True,
-                "url": video_url,
-                "title": title
-            })
+            return jsonify({"success": True, "url": video_url})
 
         return jsonify({"success": False, "message": "Invalid response"}), 500
 
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
-
-# ===== FILE SERVING =====
+# ====== FILE SERVING ======
 @app.route("/file")
 def serve_file():
-
     video_url = request.args.get("url")
-    title = request.args.get("title") or "TikTok Video"
-
-    title = clean_filename(title)
-
-    filename = f"ToolifyX Downloader-{rand}.mp4"
+    if not video_url:
+        return jsonify({"success": False, "message": "No video URL"}), 400
 
     try:
-
         r = session.get(video_url, stream=True, timeout=60)
+
+        rand = random_string()
+        filename = f"ToolifyX Downloader-{rand}.mp4"
+
+        file_size = r.headers.get("Content-Length")
 
         headers = {
             "Content-Disposition": f'attachment; filename="{filename}"',
             "Content-Type": "video/mp4"
         }
 
-        if r.headers.get("Content-Length"):
-            headers["Content-Length"] = r.headers.get("Content-Length")
+        if file_size:
+            headers["Content-Length"] = file_size
 
         return Response(
             r.iter_content(chunk_size=8192),
@@ -182,57 +163,27 @@ def serve_file():
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
+# ====== STATS ROUTE ======
+@app.route("/stats", methods=["GET"])
+def get_stats():
+    # fetch stats
+    c.execute("SELECT key, value FROM stats")
+    stats_data = dict(c.fetchall())
 
-# ===== PERMANENT STATS API =====
-@app.route("/stats")
-def stats():
+    # unique IPs
+    c.execute("SELECT COUNT(*) FROM unique_ips")
+    unique_ips_count = c.fetchone()[0]
 
-    cursor.execute("SELECT * FROM stats WHERE id=1")
-    s = cursor.fetchone()
-
-    cursor.execute("SELECT COUNT(DISTINCT ip) FROM logs")
-    unique_ips = cursor.fetchone()[0]
-
-    cursor.execute("""
-    SELECT ip, url, timestamp
-    FROM logs
-    ORDER BY id DESC
-    LIMIT 100
-    """)
-
-    logs = [
-        {"ip": row[0], "url": row[1], "timestamp": row[2]}
-        for row in cursor.fetchall()
-    ]
+    # download logs
+    c.execute("SELECT ip, url, timestamp FROM download_logs")
+    logs = [{"ip": ip, "url": url, "timestamp": ts} for ip, url, ts in c.fetchall()]
 
     return jsonify({
-        "requests": s[1],
-        "downloads": s[2],
-        "cache_hits": s[3],
-        "videos_served": s[4],
-        "unique_ips": unique_ips,
-        "logs": logs
+        **stats_data,
+        "unique_ips": unique_ips_count,
+        "download_logs": logs
     })
 
-
-# ===== ADMIN CLEAR (YOU CONTROL THIS) =====
-@app.route("/admin/clear", methods=["POST"])
-def clear():
-
-    cursor.execute("DELETE FROM logs")
-    cursor.execute("DELETE FROM cache")
-
-    cursor.execute("""
-    UPDATE stats
-    SET requests=0, downloads=0, cache_hits=0, videos_served=0
-    WHERE id=1
-    """)
-
-    conn.commit()
-
-    return jsonify({"success": True, "message": "All stats cleared"})
-
-
-# ===== START SERVER =====
+# ====== START SERVER ======
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5000, threaded=True)
