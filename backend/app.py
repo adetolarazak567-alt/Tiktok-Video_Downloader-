@@ -1,6 +1,8 @@
-import time
+ import time
 import requests
-from flask import Flask, request, jsonify
+import random
+import string
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -21,6 +23,7 @@ stats = {
 cache = {}  # url -> video_url
 
 
+# ===== DOWNLOAD API (gets video URL from TikWM) =====
 @app.route("/download", methods=["POST"])
 def download_video():
     stats["requests"] += 1
@@ -76,12 +79,13 @@ def download_video():
         if res.status_code != 200:
             return jsonify({"success": False, "message": "API error"}), 500
 
-        data = res.json()
+        result = res.json()
 
-        if data.get("data") and data["data"].get("play"):
-            video_url = data["data"]["play"]
+        if result.get("data") and result["data"].get("play"):
+            video_url = result["data"]["play"]
 
             cache[url] = video_url
+
             stats["downloads"] += 1
             stats["videos_served"] += 1
 
@@ -91,35 +95,46 @@ def download_video():
                 "timestamp": int(time.time())
             })
 
-            return jsonify({"success": True, "url": video_url})
-
-        return jsonify({"success": False, "message": "Invalid response"}), 500
-
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
-        data = res.json()
-
-        if data.get("data") and data["data"].get("play"):
-            video_url = data["data"]["play"]
-
-            cache[url] = video_url
-            stats["downloads"] += 1
-            stats["videos_served"] += 1
-
-            stats["download_logs"].append({
-                "ip": ip,
-                "url": url,
-                "timestamp": int(time.time())
+            return jsonify({
+                "success": True,
+                "url": video_url
             })
 
-            return jsonify({"success": True, "url": video_url})
-
         return jsonify({"success": False, "message": "Invalid response"}), 500
 
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
 
+# ===== FILE SERVING ROUTE (renames file to ToolifyX-random.mp4) =====
+@app.route("/file")
+def serve_file():
+
+    video_url = request.args.get("url")
+
+    if not video_url:
+        return jsonify({"success": False, "message": "No video URL"}), 400
+
+    try:
+        r = session.get(video_url, stream=True, timeout=60)
+
+        # generate random filename
+        rand = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
+        filename = f"ToolifyX-{rand}.mp4"
+
+        return Response(
+            r.iter_content(chunk_size=8192),
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Type": "video/mp4"
+            }
+        )
+
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+# ===== STATS ROUTE =====
 @app.route("/stats", methods=["GET"])
 def get_stats():
     return jsonify({
@@ -132,5 +147,6 @@ def get_stats():
     })
 
 
+# ===== START SERVER =====
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, threaded=True)
