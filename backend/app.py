@@ -184,6 +184,31 @@ def get_stats():
         "download_logs": logs
     })
 
+# ====== ADMIN RESET ======
+ADMIN_PASSWORD = "razzyadminX567"  # same password as your dashboard JS prompt
+
+@app.route("/admin/reset", methods=["POST"])
+def reset_stats():
+    data = request.get_json()
+    password = data.get("password")
+
+    if password != ADMIN_PASSWORD:
+        return jsonify({"success": False, "message": "Wrong password"}), 401
+
+    # reset stats
+    for key in ["requests", "downloads", "cache_hits", "videos_served"]:
+        c.execute("UPDATE stats SET value = 0 WHERE key = ?", (key,))
+
+    # clear unique IPs
+    c.execute("DELETE FROM unique_ips")
+
+    # clear logs
+    c.execute("DELETE FROM download_logs")
+
+    conn.commit()
+
+    return jsonify({"success": True})
+
 # ====== START SERVER ======
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, threaded=True)
