@@ -11,6 +11,23 @@ app = Flask(__name__)
 CORS(app)
 
 session = requests.Session()
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+session.headers.update({
+    "User-Agent": "Mozilla/5.0"
+})
+
+retry = Retry(
+    total=5,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504]
+)
+
+adapter = HTTPAdapter(max_retries=retry)
+
+session.mount("http://", adapter)
+session.mount("https://", adapter)
 
 # ====== SQLITE DATABASE SETUP ======
 conn = sqlite3.connect("stats.db", check_same_thread=False)
@@ -58,95 +75,156 @@ def clean_filename(text):
 def random_string(length=6):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
-# ====== FETCH TIKTOK VIDEO FUNCTION ======
+# ====== Fetch_tiktok_video ======
 def fetch_tiktok_video(url):
-    try:
-        res = session.post(
-            "https://www.tikwm.com/api/",
-            data={
-                "url": url,
-                "hd": "1"
-            },
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                "Accept": "application/json, text/javascript, */*; q=0.01",
-                "Origin": "https://www.tikwm.com",
-                "Referer": "https://www.tikwm.com/",
-                "Content-Type": "application/x-www-form-urlencoded"
-            },
-            timeout=30
-        )
 
-        if res.status_code != 200:
-            print("TikWM status:", res.status_code)
-            return None
+    max_retries = 5
 
-        json_data = res.json()
+    for attempt in range(max_retries):
 
-        if json_data.get("code") != 0:
-            print("TikWM error:", json_data)
-            return None
+        # PRIMARY API
+        try:
+            res = session.post(
+                "https://www.tikwm.com/api/",
+                data={"url": url, "hd": "1"},
+                headers={
+                    "Origin": "https://www.tikwm.com",
+                    "Referer": "https://www.tikwm.com/",
+                    "Content-Type": "application/x-www-form-urlencoded"
+                },
+                timeout=20
+            )
 
-        return json_data["data"]["play"]
+            if res.status_code == 200:
 
-    except Exception as e:
-        print("TikWM exception:", e)
-        return None
+                data = res.json()
+
+                if data.get("code") == 0:
+
+                    video = data["data"].get("play")
+
+                    if video:
+                        return video
+
+        except Exception as e:
+            print("Primary failed:", e)
+
+
+        # BACKUP API
+        try:
+            res = session.post(
+                "https://tikwm.com/api/",
+                data={"url": url},
+                timeout=20
+            )
+
+            if res.status_code == 200:
+
+                data = res.json()
+
+                video = data.get("data", {}).get("play")
+
+                if video:
+                    return video
+
+        except Exception as e:
+            print("Backup failed:", e)
+
+
+        time.sleep(2)
+
+    return None
 # ====== DOWNLOAD ROUTE ======
 @app.route("/download", methods=["POST"])
 def download_video():
-    data = request.get_json()
-    url = data.get("url")
-    ip = request.remote_addr
 
-    if not url:
-        return jsonify({"success": False, "message": "No URL"}), 400
+    try:
 
-    # increment requests
-    c.execute("UPDATE stats SET value = value + 1 WHERE key = 'requests'")
+        data = request.get_json()
+        url = data.get("url")
+        ip = request.remote_addr
 
-    # add unique IP
-    c.execute("INSERT OR IGNORE INTO unique_ips (ip) VALUES (?)", (ip,))
-    conn.commit()
+        if not url:
+            return jsonify({"success": False, "message": "No URL"}), 400
 
-    # ===== CACHE HIT =====
-    if url in cache:
-        c.execute("UPDATE stats SET value = value + 1 WHERE key = 'cache_hits'")
-        c.execute("UPDATE stats SET value = value + 1 WHERE key = 'downloads'")
-        c.execute("UPDATE stats SET value = value + 1 WHERE key = 'videos_served'")
-        conn.commit()
 
-        c.execute(
-            "INSERT INTO download_logs (ip, url, timestamp) VALUES (?, ?, ?)",
-            (ip, url, int(time.time()))
-        )
-        conn.commit()
+        # increment requests safely
+        try:
+            c.execute("UPDATE stats SET value = value + 1 WHERE key='requests'")
+            c.execute("INSERT OR IGNORE INTO unique_ips (ip) VALUES (?)", (ip,))
+            conn.commit()
+        except:
+            pass
 
-        filename = clean_filename("TikTok Video") + f"_{random_string()}.mp4"
-        return jsonify({"success": True, "url": cache[url], "filename": filename})
 
-    # ===== FETCH FROM TIKWM =====
-    video_url = fetch_tiktok_video(url)
-    if not video_url:
-        return jsonify({"success": False, "message": "TikWM API failed"}), 500
+        # CACHE HIT (FASTEST)
+        if url in cache:
 
-    # cache it
-    cache[url] = video_url
+            try:
+                c.execute("UPDATE stats SET value=value+1 WHERE key='cache_hits'")
+                c.execute("UPDATE stats SET value=value+1 WHERE key='downloads'")
+                c.execute("UPDATE stats SET value=value+1 WHERE key='videos_served'")
+                conn.commit()
+            except:
+                pass
 
-    # increment stats
-    c.execute("UPDATE stats SET value = value + 1 WHERE key = 'downloads'")
-    c.execute("UPDATE stats SET value = value + 1 WHERE key = 'videos_served'")
+            filename = clean_filename("ToolifyX Downloader") + "_" + random_string() + ".mp4"
 
-    # log download
-    c.execute(
-        "INSERT INTO download_logs (ip, url, timestamp) VALUES (?, ?, ?)",
-        (ip, url, int(time.time()))
-    )
-    conn.commit()
+            return jsonify({
+                "success": True,
+                "url": cache[url],
+                "filename": filename
+            })
 
-    # generate filename
-    filename = clean_filename("TikTok Video") + f"_{random_string()}.mp4"
-    return jsonify({"success": True, "url": video_url, "filename": filename})
+
+        # FETCH VIDEO (RETRY SAFE)
+        video_url = fetch_tiktok_video(url)
+
+        if not video_url:
+            return jsonify({
+                "success": False,
+                "message": "Fetch failed, try again"
+            }), 500
+
+
+        # SAVE CACHE
+        cache[url] = video_url
+
+
+        # update stats safely
+        try:
+            c.execute("UPDATE stats SET value=value+1 WHERE key='downloads'")
+            c.execute("UPDATE stats SET value=value+1 WHERE key='videos_served'")
+
+            c.execute(
+                "INSERT INTO download_logs (ip, url, timestamp) VALUES (?, ?, ?)",
+                (ip, url, int(time.time()))
+            )
+
+            conn.commit()
+        except:
+            pass
+
+
+        filename = clean_filename("ToolifyX Downloader") + "_" + random_string() + ".mp4"
+
+        return jsonify({
+            "success": True,
+            "url": video_url,
+            "filename": filename
+        })
+
+
+    except Exception as e:
+
+        print("CRASH PREVENTED:", e)
+
+        return jsonify({
+            "success": False,
+            "message": "Server recovered automatically"
+        }), 500
+
+    
 
 # ====== FILE SERVING ======
 @app.route("/file")
@@ -175,6 +253,7 @@ def serve_file():
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
+
 # ====== STATS ======
 @app.route("/stats", methods=["GET"])
 def get_stats():
@@ -188,6 +267,14 @@ def get_stats():
     logs = [{"ip": ip, "url": url, "timestamp": ts} for ip, url, ts in c.fetchall()]
 
     return jsonify({**stats_data, "unique_ips": unique_ips_count, "download_logs": logs})
+
+# ====== WAKE ROUTE (KEEP SERVER ALIVE) ======
+@app.route("/wake", methods=["GET"])
+def wake():
+    return jsonify({
+        "success": True,
+        "message": "Server is awake"
+    })
 
 # ====== ADMIN RESET ======
 ADMIN_PASSWORD = "razzyadminX567"
@@ -210,4 +297,9 @@ def reset_stats():
 
 # ====== START SERVER ======
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    while True:
+        try:
+            app.run(host="0.0.0.0", port=5000, threaded=True)
+        except Exception as e:
+            print("Server crashed, restarting...", e)
+            time.sleep(5)
