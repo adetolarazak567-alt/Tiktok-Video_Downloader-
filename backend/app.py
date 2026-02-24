@@ -23,7 +23,6 @@ CREATE TABLE IF NOT EXISTS stats (
     value INTEGER
 )
 ''')
-# Initialize stats if not exists
 for key in ["requests", "downloads", "cache_hits", "videos_served"]:
     c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES (?, ?)", (key, 0))
 conn.commit()
@@ -46,20 +45,40 @@ CREATE TABLE IF NOT EXISTS download_logs (
 ''')
 conn.commit()
 
-# ====== CACHE STORAGE ======
-cache = {}  # url -> video_url (still in-memory for speed)
+# ====== CACHE ======
+cache = {}  # url -> video_url
 
 # ====== FILENAME CLEANING ======
 def clean_filename(text):
-    text = re.sub(r'[\\/*?:"<>|]', "", text)  # remove invalid characters
+    text = re.sub(r'[\\/*?:"<>|]', "", text)
     text = re.sub(r'\s+', " ", text).strip()
-    return text[:120]  # limit length
+    return text[:120]
 
 # ====== RANDOM STRING ======
 def random_string(length=6):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
-# ====== DOWNLOAD API ======
+# ====== FETCH TIKTOK VIDEO FUNCTION ======
+def fetch_tiktok_video(url):
+    try:
+        res = session.post(
+            "https://www.tikwm.com/api/",
+            json={"url": url},
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+                "Content-Type": "application/json"
+            },
+            timeout=30
+        )
+        if res.status_code != 200:
+            return None
+        data = res.json().get("data", {})
+        return data.get("play")
+    except:
+        return None
+
+# ====== DOWNLOAD ROUTE ======
 @app.route("/download", methods=["POST"])
 def download_video():
     data = request.get_json()
@@ -83,54 +102,37 @@ def download_video():
         c.execute("UPDATE stats SET value = value + 1 WHERE key = 'videos_served'")
         conn.commit()
 
-        # log download
         c.execute(
             "INSERT INTO download_logs (ip, url, timestamp) VALUES (?, ?, ?)",
             (ip, url, int(time.time()))
         )
         conn.commit()
 
-        return jsonify({"success": True, "url": cache[url]})
+        filename = clean_filename("TikTok Video") + f"_{random_string()}.mp4"
+        return jsonify({"success": True, "url": cache[url], "filename": filename})
 
-    try:
-        res = session.post(
-            "https://www.tikwm.com/api/",
-            json={"url": url},
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Accept": "application/json",
-                "Content-Type": "application/json"
-            },
-            timeout=30
-        )
+    # ===== FETCH FROM TIKWM =====
+    video_url = fetch_tiktok_video(url)
+    if not video_url:
+        return jsonify({"success": False, "message": "TikWM API failed"}), 500
 
-        if res.status_code != 200:
-            return jsonify({"success": False, "message": "API error"}), 500
+    # cache it
+    cache[url] = video_url
 
-        result = res.json()
+    # increment stats
+    c.execute("UPDATE stats SET value = value + 1 WHERE key = 'downloads'")
+    c.execute("UPDATE stats SET value = value + 1 WHERE key = 'videos_served'")
 
-        if result.get("data") and result["data"].get("play"):
-            video_url = result["data"]["play"]
+    # log download
+    c.execute(
+        "INSERT INTO download_logs (ip, url, timestamp) VALUES (?, ?, ?)",
+        (ip, url, int(time.time()))
+    )
+    conn.commit()
 
-            # store in cache
-            cache[url] = video_url
-
-            # increment stats
-            c.execute("UPDATE stats SET value = value + 1 WHERE key = 'downloads'")
-            c.execute("UPDATE stats SET value = value + 1 WHERE key = 'videos_served'")
-            # log download
-            c.execute(
-                "INSERT INTO download_logs (ip, url, timestamp) VALUES (?, ?, ?)",
-                (ip, url, int(time.time()))
-            )
-            conn.commit()
-
-            return jsonify({"success": True, "url": video_url})
-
-        return jsonify({"success": False, "message": "Invalid response"}), 500
-
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
+    # generate filename
+    filename = clean_filename("TikTok Video") + f"_{random_string()}.mp4"
+    return jsonify({"success": True, "url": video_url, "filename": filename})
 
 # ====== FILE SERVING ======
 @app.route("/file")
@@ -155,37 +157,26 @@ def serve_file():
         if file_size:
             headers["Content-Length"] = file_size
 
-        return Response(
-            r.iter_content(chunk_size=8192),
-            headers=headers
-        )
-
+        return Response(r.iter_content(chunk_size=8192), headers=headers)
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
-# ====== STATS ROUTE ======
+# ====== STATS ======
 @app.route("/stats", methods=["GET"])
 def get_stats():
-    # fetch stats
     c.execute("SELECT key, value FROM stats")
     stats_data = dict(c.fetchall())
 
-    # unique IPs
     c.execute("SELECT COUNT(*) FROM unique_ips")
     unique_ips_count = c.fetchone()[0]
 
-    # download logs
     c.execute("SELECT ip, url, timestamp FROM download_logs")
     logs = [{"ip": ip, "url": url, "timestamp": ts} for ip, url, ts in c.fetchall()]
 
-    return jsonify({
-        **stats_data,
-        "unique_ips": unique_ips_count,
-        "download_logs": logs
-    })
+    return jsonify({**stats_data, "unique_ips": unique_ips_count, "download_logs": logs})
 
 # ====== ADMIN RESET ======
-ADMIN_PASSWORD = "razzyadminX567"  # same password as your dashboard JS prompt
+ADMIN_PASSWORD = "razzyadminX567"
 
 @app.route("/admin/reset", methods=["POST"])
 def reset_stats():
@@ -195,16 +186,10 @@ def reset_stats():
     if password != ADMIN_PASSWORD:
         return jsonify({"success": False, "message": "Wrong password"}), 401
 
-    # reset stats
     for key in ["requests", "downloads", "cache_hits", "videos_served"]:
         c.execute("UPDATE stats SET value = 0 WHERE key = ?", (key,))
-
-    # clear unique IPs
     c.execute("DELETE FROM unique_ips")
-
-    # clear logs
     c.execute("DELETE FROM download_logs")
-
     conn.commit()
 
     return jsonify({"success": True})
