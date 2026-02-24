@@ -63,21 +63,35 @@ def fetch_tiktok_video(url):
     try:
         res = session.post(
             "https://www.tikwm.com/api/",
-            json={"url": url},
+            data={
+                "url": url,
+                "hd": "1"
+            },
             headers={
-                "User-Agent": "Mozilla/5.0",
-                "Accept": "application/json",
-                "Content-Type": "application/json"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Origin": "https://www.tikwm.com",
+                "Referer": "https://www.tikwm.com/",
+                "Content-Type": "application/x-www-form-urlencoded"
             },
             timeout=30
         )
-        if res.status_code != 200:
-            return None
-        data = res.json().get("data", {})
-        return data.get("play")
-    except:
-        return None
 
+        if res.status_code != 200:
+            print("TikWM status:", res.status_code)
+            return None
+
+        json_data = res.json()
+
+        if json_data.get("code") != 0:
+            print("TikWM error:", json_data)
+            return None
+
+        return json_data["data"]["play"]
+
+    except Exception as e:
+        print("TikWM exception:", e)
+        return None
 # ====== DOWNLOAD ROUTE ======
 @app.route("/download", methods=["POST"])
 def download_video():
