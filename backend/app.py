@@ -242,9 +242,9 @@ def serve_file():
         file_size = r.headers.get("Content-Length")
 
         headers = {
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Type": "video/mp4"
-        }
+    "Content-Disposition": f'inline; filename="{filename}"',
+    "Content-Type": "video/mp4"
+}
 
         if file_size:
             headers["Content-Length"] = file_size
