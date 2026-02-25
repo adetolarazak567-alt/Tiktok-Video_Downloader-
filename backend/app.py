@@ -20,7 +20,7 @@ session.headers.update({
 
 retry = Retry(
     total=5,
-    backoff_factor=1,
+    backoff_factor=0.5,
     status_forcelist=[429, 500, 502, 503, 504]
 )
 
@@ -91,7 +91,7 @@ def random_string(length=6):
 # ====== Fetch_tiktok_video ======
 def fetch_tiktok_video(url):
 
-    max_retries = 5
+    max_retries = 2
 
     for attempt in range(max_retries):
 
@@ -105,7 +105,7 @@ def fetch_tiktok_video(url):
                     "Referer": "https://www.tikwm.com/",
                     "Content-Type": "application/x-www-form-urlencoded"
                 },
-                timeout=20
+                timeout=6
             )
 
             if res.status_code == 200:
@@ -128,7 +128,7 @@ def fetch_tiktok_video(url):
             res = session.post(
                 "https://tikwm.com/api/",
                 data={"url": url},
-                timeout=20
+                timeout=6
             )
 
             if res.status_code == 200:
@@ -269,7 +269,7 @@ def serve_file():
 
     try:
 
-        r = session.get(video_url, stream=True, timeout=60)
+        r = session.get(video_url, stream=True, timeout=10)
 
         rand = random_string()
         filename = f"ToolifyX Downloader-{rand}.mp4"
@@ -349,4 +349,4 @@ if __name__ == "__main__":
             app.run(host="0.0.0.0", port=5000, threaded=True)
         except Exception as e:
             print("Server crashed, restarting...", e)
-            time.sleep(5)
+            time.sleep(0.5)
