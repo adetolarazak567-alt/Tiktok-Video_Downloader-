@@ -273,17 +273,17 @@ def serve_file():
         file_size = r.headers.get("Content-Length")
 
         headers = {
-    "Content-Disposition": f'inline; filename="{filename}"',
-    "Content-Type": "video/mp4"
-}
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Type": "video/mp4"
+        }
 
         if file_size:
             headers["Content-Length"] = file_size
 
         return Response(r.iter_content(chunk_size=8192), headers=headers)
+
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
-
 
 # ====== STATS ======
 @app.route("/stats", methods=["GET"])
