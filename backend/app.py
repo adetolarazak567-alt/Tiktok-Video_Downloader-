@@ -260,11 +260,15 @@ def download_video():
 # ====== FILE SERVING ======
 @app.route("/file")
 def serve_file():
+
     video_url = request.args.get("url")
+    mode = request.args.get("mode", "preview")  # preview OR download
+
     if not video_url:
         return jsonify({"success": False, "message": "No video URL"}), 400
 
     try:
+
         r = session.get(video_url, stream=True, timeout=60)
 
         rand = random_string()
@@ -272,18 +276,30 @@ def serve_file():
 
         file_size = r.headers.get("Content-Length")
 
+        # IMPORTANT: different headers for preview vs download
+        if mode == "download":
+            disposition = f'attachment; filename="{filename}"'
+        else:
+            disposition = f'inline; filename="{filename}"'
+
         headers = {
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": disposition,
             "Content-Type": "video/mp4"
         }
 
         if file_size:
             headers["Content-Length"] = file_size
 
-        return Response(r.iter_content(chunk_size=8192), headers=headers)
+        return Response(
+            r.iter_content(chunk_size=8192),
+            headers=headers
+        )
 
     except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
+        return jsonify({
+            "success": False,
+            "message": str(e)
+        }), 500
 
 # ====== STATS ======
 @app.route("/stats", methods=["GET"])
