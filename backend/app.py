@@ -24,7 +24,12 @@ retry = Retry(
     status_forcelist=[429, 500, 502, 503, 504]
 )
 
-adapter = HTTPAdapter(max_retries=retry)
+
+adapter = HTTPAdapter(
+    max_retries=retry,
+    pool_connections=200,
+    pool_maxsize=200
+)
 
 session.mount("http://", adapter)
 session.mount("https://", adapter)
@@ -50,6 +55,14 @@ CREATE TABLE IF NOT EXISTS unique_ips (
     ip TEXT PRIMARY KEY
 )
 ''')
+# Permanent video cache
+c.execute('''
+CREATE TABLE IF NOT EXISTS video_cache (
+    url TEXT PRIMARY KEY,
+    video_url TEXT
+)
+''')
+conn.commit()
 
 # Table for download logs
 c.execute('''
@@ -157,22 +170,35 @@ def download_video():
             pass
 
 
-        # CACHE HIT (FASTEST)
-        if url in cache:
+      # ===== FASTEST CACHE CHECK =====
 
-            try:
-                c.execute("UPDATE stats SET value=value+1 WHERE key='cache_hits'")
-                c.execute("UPDATE stats SET value=value+1 WHERE key='downloads'")
-                c.execute("UPDATE stats SET value=value+1 WHERE key='videos_served'")
-                conn.commit()
-            except:
-                pass
+        # RAM cache (fastest)
+        if url in cache:
 
             filename = clean_filename("ToolifyX Downloader") + "_" + random_string() + ".mp4"
 
             return jsonify({
                 "success": True,
                 "url": cache[url],
+                "filename": filename
+            })
+
+
+        # DATABASE cache (still instant)
+        c.execute("SELECT video_url FROM video_cache WHERE url=?", (url,))
+        row = c.fetchone()
+
+        if row:
+
+            video_url = row[0]
+
+            cache[url] = video_url
+
+            filename = clean_filename("ToolifyX Downloader") + "_" + random_string() + ".mp4"
+
+            return jsonify({
+                "success": True,
+                "url": video_url,
                 "filename": filename
             })
 
@@ -187,9 +213,14 @@ def download_video():
             }), 500
 
 
-        # SAVE CACHE
+        # SAVE CACHE (RAM + DATABASE)
         cache[url] = video_url
 
+        c.execute(
+            "INSERT OR IGNORE INTO video_cache (url, video_url) VALUES (?, ?)",
+            (url, video_url)
+        )
+        conn.commit()
 
         # update stats safely
         try:
