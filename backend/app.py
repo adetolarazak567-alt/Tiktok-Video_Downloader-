@@ -105,7 +105,7 @@ def fetch_tiktok_video(url):
                     "Referer": "https://www.tikwm.com/",
                     "Content-Type": "application/x-www-form-urlencoded"
                 },
-                timeout=6
+                timeout=3
             )
 
             if res.status_code == 200:
@@ -128,7 +128,7 @@ def fetch_tiktok_video(url):
             res = session.post(
                 "https://tikwm.com/api/",
                 data={"url": url},
-                timeout=6
+                timeout=3
             )
 
             if res.status_code == 200:
