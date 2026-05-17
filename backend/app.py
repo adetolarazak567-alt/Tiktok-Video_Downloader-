@@ -120,7 +120,7 @@ def generate_etag(url):
 def expand_url(url):
     try:
         if any(x in url for x in ["vt.tiktok.com", "vm.tiktok.com", "t.tiktok.com", "tiktok.com/t/"]):
-            r = session.head(url, allow_redirects=True, timeout=8)
+            r = session.head(url, allow_redirects=True, timeout=10)
             return r.url
     except Exception as e:
         print("Expand URL error:", e)
@@ -192,66 +192,81 @@ def fetch_tiktok_metadata(url):
     
     return None
 
-# ===== API FETCHERS =====
-def fetch_tikwm(url):
+# ===== WORKING API FETCHERS (Multiple fallbacks) =====
+
+def fetch_ssstik(url):
+    """SSSTik.io API - widely reliable"""
     try:
         res = session.post(
-            "https://www.tikwm.com/api/",
-            data={"url": url, "hd": "1"},
+            "https://ssstik.io/abc?url=dl",
+            data={"id": url, "locale": "en", "tt": "0"},
             timeout=10,
-            headers={"Content-Type": "application/x-www-form-urlencoded"}
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "https://ssstik.io",
+                "Referer": "https://ssstik.io/en",
+            }
         )
         if res.status_code == 200:
-            data = res.json()
-            video = data.get("data", {}).get("play")
-            if video:
-                meta = data.get("data", {})
+            html = res.text
+            # Extract download link from HTML
+            video_match = re.search(r'href="(https://[^"]*\.mp4[^"]*)"', html)
+            if video_match:
                 return {
-                    "video_url": video,
-                    "title": meta.get("title", ""),
-                    "author": meta.get("author", {}).get("nickname", "") if isinstance(meta.get("author"), dict) else "",
-                    "thumbnail": meta.get("cover", ""),
+                    "video_url": video_match.group(1),
+                    "title": "",
+                    "author": "",
+                    "thumbnail": "",
                 }
     except Exception as e:
-        print("tikwm error:", e)
+        print("ssstik error:", e)
     return None
 
 
-def fetch_tikwm_alt(url):
+def fetch_snaptik(url):
+    """SnapTik.app API"""
     try:
         res = session.post(
-            "https://tikwm.com/api/",
+            "https://snaptik.app/abc2.php",
             data={"url": url},
             timeout=10,
-            headers={"Content-Type": "application/x-www-form-urlencoded"}
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "https://snaptik.app",
+                "Referer": "https://snaptik.app/",
+            }
         )
         if res.status_code == 200:
             data = res.json()
-            video = data.get("data", {}).get("play")
-            if video:
-                meta = data.get("data", {})
+            video_url = data.get("url") or data.get("link")
+            if video_url:
                 return {
-                    "video_url": video,
-                    "title": meta.get("title", ""),
-                    "author": meta.get("author", {}).get("nickname", "") if isinstance(meta.get("author"), dict) else "",
-                    "thumbnail": meta.get("cover", ""),
+                    "video_url": video_url,
+                    "title": data.get("title", ""),
+                    "author": data.get("author", ""),
+                    "thumbnail": data.get("cover", ""),
                 }
     except Exception as e:
-        print("tikwm_alt error:", e)
+        print("snaptik error:", e)
     return None
 
 
-def fetch_backup(url):
+def fetch_tikmate(url):
+    """TikMate API"""
     try:
         res = session.post(
-            "https://api2.musicaldown.com/v2/download",
+            "https://tikmate.app/api/lookup",
             data={"url": url},
-            timeout=12,
-            headers={"Content-Type": "application/x-www-form-urlencoded"}
+            timeout=10,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "https://tikmate.app",
+                "Referer": "https://tikmate.app/",
+            }
         )
         if res.status_code == 200:
             data = res.json()
-            video_url = data.get("video", {}).get("no_watermark")
+            video_url = data.get("videoUrl") or data.get("video_url")
             if video_url:
                 return {
                     "video_url": video_url,
@@ -260,19 +275,109 @@ def fetch_backup(url):
                     "thumbnail": data.get("thumbnail", ""),
                 }
     except Exception as e:
-        print("backup error:", e)
+        print("tikmate error:", e)
     return None
 
-# ===== PARALLEL FETCH =====
+
+def fetch_savettok(url):
+    """Savettok.org API"""
+    try:
+        res = session.post(
+            "https://savettok.org/api/download",
+            json={"url": url},
+            timeout=10,
+            headers={
+                "Content-Type": "application/json",
+                "Origin": "https://savettok.org",
+                "Referer": "https://savettok.org/",
+            }
+        )
+        if res.status_code == 200:
+            data = res.json()
+            video_url = data.get("video_url") or data.get("url")
+            if video_url:
+                return {
+                    "video_url": video_url,
+                    "title": data.get("title", ""),
+                    "author": data.get("author", ""),
+                    "thumbnail": data.get("thumbnail", ""),
+                }
+    except Exception as e:
+        print("savettok error:", e)
+    return None
+
+
+def fetch_tikdown(url):
+    """TikDown API"""
+    try:
+        res = session.post(
+            "https://tikdown.org/getVideo",
+            data={"url": url},
+            timeout=10,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "https://tikdown.org",
+                "Referer": "https://tikdown.org/",
+            }
+        )
+        if res.status_code == 200:
+            data = res.json()
+            video_url = data.get("video") or data.get("videoUrl")
+            if video_url:
+                return {
+                    "video_url": video_url,
+                    "title": data.get("title", ""),
+                    "author": data.get("author", ""),
+                    "thumbnail": data.get("thumbnail", ""),
+                }
+    except Exception as e:
+        print("tikdown error:", e)
+    return None
+
+
+def fetch_rapidapi(url):
+    """RapidAPI TikTok downloader (requires API key)"""
+    api_key = os.getenv("RAPIDAPI_KEY")
+    if not api_key:
+        return None
+    
+    try:
+        res = session.get(
+            "https://tiktok-video-no-watermark2.p.rapidapi.com/",
+            params={"url": url, "hd": "1"},
+            timeout=10,
+            headers={
+                "X-RapidAPI-Key": api_key,
+                "X-RapidAPI-Host": "tiktok-video-no-watermark2.p.rapidapi.com",
+            }
+        )
+        if res.status_code == 200:
+            data = res.json()
+            video_url = data.get("data", {}).get("play") or data.get("video")
+            if video_url:
+                return {
+                    "video_url": video_url,
+                    "title": data.get("data", {}).get("title", ""),
+                    "author": data.get("data", {}).get("author", {}).get("nickname", ""),
+                    "thumbnail": data.get("data", {}).get("cover", ""),
+                }
+    except Exception as e:
+        print("rapidapi error:", e)
+    return None
+
+# ===== PARALLEL FETCH (5+ APIs) =====
 def fetch_tiktok_video(url):
     url = expand_url(url)
     metadata = None
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
         futures = [
-            executor.submit(fetch_tikwm, url),
-            executor.submit(fetch_tikwm_alt, url),
-            executor.submit(fetch_backup, url),
+            executor.submit(fetch_ssstik, url),
+            executor.submit(fetch_snaptik, url),
+            executor.submit(fetch_tikmate, url),
+            executor.submit(fetch_savettok, url),
+            executor.submit(fetch_tikdown, url),
+            executor.submit(fetch_rapidapi, url),
         ]
         
         meta_future = executor.submit(fetch_tiktok_metadata, url)
@@ -299,9 +404,8 @@ def fetch_tiktok_video(url):
     
     return video_result
 
-# ===== PROBE VIDEO HEADERS (for resume support) =====
+# ===== PROBE VIDEO HEADERS =====
 def probe_video_headers(video_url):
-    """Probe the actual video URL to get Content-Length, ETag, Last-Modified for resume support"""
     try:
         r = session.head(video_url, timeout=10, allow_redirects=True)
         if r.status_code in (200, 206):
@@ -411,7 +515,7 @@ def download_video():
         print("FETCH RESULT:", result)
 
         if not result or not result.get("video_url"):
-            return jsonify({"success":False,"message":"Fetch failed"}),500
+            return jsonify({"success":False,"message":"Fetch failed - all APIs unavailable"}),500
 
         video_url = result["video_url"]
         title = result.get("title", "")
@@ -487,7 +591,7 @@ def serve_file():
         return jsonify({"success":False,"message":"No video URL"}),400
 
     try:
-        # First, probe the source to check if it supports ranges
+        # Probe source for range support
         head_resp = session.head(video_url, timeout=10, allow_redirects=True)
         source_supports_range = head_resp.headers.get("Accept-Ranges") == "bytes"
         source_content_length = head_resp.headers.get("Content-Length")
@@ -522,7 +626,7 @@ def serve_file():
         status_code = 200
         response_headers = {
             "Content-Type": r.headers.get("Content-Type", "video/mp4"),
-            "Accept-Ranges": "bytes",  # Tell client WE support ranges
+            "Accept-Ranges": "bytes",
         }
 
         # Handle range response from source
@@ -531,7 +635,6 @@ def serve_file():
             response_headers["Content-Range"] = r.headers.get("Content-Range")
             response_headers["Content-Length"] = r.headers.get("Content-Length")
         else:
-            # Full content
             if source_content_length:
                 response_headers["Content-Length"] = source_content_length
 
@@ -543,7 +646,7 @@ def serve_file():
         )
         response_headers["Content-Disposition"] = disposition
 
-        # ETag for cache validation (helps resume)
+        # ETag for cache validation
         etag = source_etag or generate_etag(video_url)
         response_headers["ETag"] = f'"{etag}"'
         
@@ -557,7 +660,7 @@ def serve_file():
 
         # Stream generator with larger chunks for speed
         def generate():
-            chunk_size = 262144  # 256KB chunks for faster transfer
+            chunk_size = 262144  # 256KB chunks
             try:
                 for chunk in r.iter_content(chunk_size=chunk_size):
                     if chunk:
