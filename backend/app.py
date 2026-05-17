@@ -6,6 +6,7 @@ import string
 import re
 import sqlite3
 import concurrent.futures
+import hashlib
 from dotenv import load_dotenv
 import os
 import json
@@ -24,7 +25,14 @@ session = requests.Session()
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"})
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+})
 
 retry = Retry(
     total=3,
@@ -72,6 +80,9 @@ CREATE TABLE IF NOT EXISTS video_cache (
     title TEXT,
     author TEXT,
     thumbnail TEXT,
+    content_length INTEGER,
+    etag TEXT,
+    last_modified TEXT,
     created_at INTEGER
 )
 ''')
@@ -102,10 +113,13 @@ def clean_filename(text):
 def random_string(length=6):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
+def generate_etag(url):
+    return hashlib.md5(url.encode()).hexdigest()[:16]
+
 # ===== EXPAND SHORT TIKTOK LINKS =====
 def expand_url(url):
     try:
-        if "vt.tiktok.com" in url or "vm.tiktok.com" in url or "t.tiktok.com" in url:
+        if any(x in url for x in ["vt.tiktok.com", "vm.tiktok.com", "t.tiktok.com", "tiktok.com/t/"]):
             r = session.head(url, allow_redirects=True, timeout=8)
             return r.url
     except Exception as e:
@@ -114,7 +128,6 @@ def expand_url(url):
 
 # ===== TIKTOK METADATA EXTRACTION =====
 def extract_video_id(url):
-    """Extract video ID from TikTok URL"""
     patterns = [
         r'tiktok\.com/@[\w.]+/video/(\d+)',
         r'tiktok\.com/t/(\w+)',
@@ -128,15 +141,11 @@ def extract_video_id(url):
     return None
 
 def fetch_tiktok_metadata(url):
-    """Fetch video metadata (title, author, thumbnail) from TikTok page"""
     try:
-        # Try to get metadata from the page
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
         }
         
         r = session.get(url, headers=headers, timeout=10, allow_redirects=True)
@@ -146,7 +155,6 @@ def fetch_tiktok_metadata(url):
             
         html = r.text
         
-        # Try to extract from JSON-LD
         json_ld_match = re.search(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', html, re.DOTALL)
         if json_ld_match:
             try:
@@ -160,7 +168,6 @@ def fetch_tiktok_metadata(url):
             except json.JSONDecodeError:
                 pass
         
-        # Try to extract from meta tags
         title_match = re.search(r'<meta[^>]*property="og:title"[^>]*content="([^"]*)"', html)
         desc_match = re.search(r'<meta[^>]*property="og:description"[^>]*content="([^"]*)"', html)
         author_match = re.search(r'<meta[^>]*property="og:author"[^>]*content="([^"]*)"', html)
@@ -170,7 +177,6 @@ def fetch_tiktok_metadata(url):
         author = author_match.group(1) if author_match else ""
         thumbnail = thumb_match.group(1) if thumb_match else ""
         
-        # Clean up title
         title = re.sub(r' on TikTok$', '', title)
         title = re.sub(r' \| TikTok$', '', title)
         
@@ -192,14 +198,13 @@ def fetch_tikwm(url):
         res = session.post(
             "https://www.tikwm.com/api/",
             data={"url": url, "hd": "1"},
-            timeout=8,
+            timeout=10,
             headers={"Content-Type": "application/x-www-form-urlencoded"}
         )
         if res.status_code == 200:
             data = res.json()
             video = data.get("data", {}).get("play")
             if video:
-                # Also try to get metadata from tikwm response
                 meta = data.get("data", {})
                 return {
                     "video_url": video,
@@ -217,7 +222,7 @@ def fetch_tikwm_alt(url):
         res = session.post(
             "https://tikwm.com/api/",
             data={"url": url},
-            timeout=8,
+            timeout=10,
             headers={"Content-Type": "application/x-www-form-urlencoded"}
         )
         if res.status_code == 200:
@@ -241,7 +246,7 @@ def fetch_backup(url):
         res = session.post(
             "https://api2.musicaldown.com/v2/download",
             data={"url": url},
-            timeout=10,
+            timeout=12,
             headers={"Content-Type": "application/x-www-form-urlencoded"}
         )
         if res.status_code == 200:
@@ -258,25 +263,20 @@ def fetch_backup(url):
         print("backup error:", e)
     return None
 
-# ===== PARALLEL FETCH (ULTRA FAST) =====
+# ===== PARALLEL FETCH =====
 def fetch_tiktok_video(url):
     url = expand_url(url)
-    
-    # Also fetch metadata in parallel
     metadata = None
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        # Submit video fetchers
         futures = [
             executor.submit(fetch_tikwm, url),
             executor.submit(fetch_tikwm_alt, url),
             executor.submit(fetch_backup, url),
         ]
         
-        # Submit metadata fetcher
         meta_future = executor.submit(fetch_tiktok_metadata, url)
         
-        # Get first successful video result
         video_result = None
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
@@ -284,13 +284,11 @@ def fetch_tiktok_video(url):
                 video_result = result
                 break
         
-        # Get metadata
         try:
             metadata = meta_future.result(timeout=5)
         except:
             pass
     
-    # Merge metadata if video fetcher didn't provide it
     if video_result and metadata:
         if not video_result.get("title") and metadata.get("title"):
             video_result["title"] = metadata["title"]
@@ -301,17 +299,34 @@ def fetch_tiktok_video(url):
     
     return video_result
 
+# ===== PROBE VIDEO HEADERS (for resume support) =====
+def probe_video_headers(video_url):
+    """Probe the actual video URL to get Content-Length, ETag, Last-Modified for resume support"""
+    try:
+        r = session.head(video_url, timeout=10, allow_redirects=True)
+        if r.status_code in (200, 206):
+            return {
+                "content_length": r.headers.get("Content-Length"),
+                "etag": r.headers.get("ETag"),
+                "last_modified": r.headers.get("Last-Modified"),
+                "accept_ranges": r.headers.get("Accept-Ranges"),
+                "content_type": r.headers.get("Content-Type", "video/mp4"),
+            }
+    except Exception as e:
+        print("Probe error:", e)
+    return {}
+
 # ===== SAVE CACHE =====
-def save_cache_db(url, video_url, title="", author="", thumbnail=""):
+def save_cache_db(url, video_url, title="", author="", thumbnail="", content_length=None, etag=None, last_modified=None):
     try:
         conn2 = sqlite3.connect("stats.db")
         c2 = conn2.cursor()
 
         c2.execute(
             """INSERT OR REPLACE INTO video_cache 
-               (url, video_url, title, author, thumbnail, created_at) 
-               VALUES (?,?,?,?,?,?)""",
-            (url, video_url, title, author, thumbnail, int(time.time()))
+               (url, video_url, title, author, thumbnail, content_length, etag, last_modified, created_at) 
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (url, video_url, title, author, thumbnail, content_length, etag, last_modified, int(time.time()))
         )
 
         conn2.commit()
@@ -362,11 +377,11 @@ def download_video():
             })
 
         # DB cache
-        c.execute("SELECT video_url, title, author, thumbnail FROM video_cache WHERE url=?",(url,))
+        c.execute("SELECT video_url, title, author, thumbnail, content_length, etag, last_modified FROM video_cache WHERE url=?",(url,))
         row = c.fetchone()
 
         if row:
-            video_url, db_title, db_author, db_thumbnail = row
+            video_url, db_title, db_author, db_thumbnail, db_cl, db_etag, db_lm = row
             cache[url] = video_url
             metadata_cache[url] = {
                 "title": db_title or "",
@@ -403,6 +418,12 @@ def download_video():
         author = result.get("author", "")
         thumbnail = result.get("thumbnail", "")
 
+        # Probe video headers for resume support
+        headers_info = probe_video_headers(video_url)
+        content_length = headers_info.get("content_length")
+        etag = headers_info.get("etag")
+        last_modified = headers_info.get("last_modified")
+
         # RAM cache
         cache[url] = video_url
         metadata_cache[url] = {
@@ -411,10 +432,10 @@ def download_video():
             "thumbnail": thumbnail
         }
 
-        # Save DB async
+        # Save DB async with header info
         threading.Thread(
             target=save_cache_db,
-            args=(url, video_url, title, author, thumbnail),
+            args=(url, video_url, title, author, thumbnail, content_length, etag, last_modified),
             daemon=True
         ).start()
 
@@ -454,7 +475,7 @@ def download_video():
             "message":"Server recovered automatically"
         }),500
 
-# ===== FILE SERVING =====
+# ===== RESUMABLE FILE SERVING =====
 @app.route("/file")
 def serve_file():
 
@@ -466,11 +487,17 @@ def serve_file():
         return jsonify({"success":False,"message":"No video URL"}),400
 
     try:
+        # First, probe the source to check if it supports ranges
+        head_resp = session.head(video_url, timeout=10, allow_redirects=True)
+        source_supports_range = head_resp.headers.get("Accept-Ranges") == "bytes"
+        source_content_length = head_resp.headers.get("Content-Length")
+        source_etag = head_resp.headers.get("ETag")
+        source_last_modified = head_resp.headers.get("Last-Modified")
 
-        r = session.get(video_url,stream=True,timeout=15)
-
+        # Parse Range header from client
+        range_header = request.headers.get("Range")
+        
         rand = random_string()
-
         if custom_filename:
             filename = clean_filename(custom_filename)
             if not filename.endswith(".mp4"):
@@ -478,28 +505,75 @@ def serve_file():
         else:
             filename = f"ToolifyX Downloader-{rand}.mp4"
 
-        file_size = r.headers.get("Content-Length")
+        # Build request to source
+        source_headers = {}
+        if range_header and source_supports_range:
+            source_headers["Range"] = range_header
 
-        disposition = (
-            f'attachment; filename="{filename}"'
-            if mode=="download"
-            else f'inline; filename="{filename}"'
+        # Stream from source with range support
+        r = session.get(
+            video_url, 
+            stream=True, 
+            timeout=30,
+            headers=source_headers
         )
 
-        headers = {
-            "Content-Disposition":disposition,
-            "Content-Type":"video/mp4"
+        # Determine response status and headers
+        status_code = 200
+        response_headers = {
+            "Content-Type": r.headers.get("Content-Type", "video/mp4"),
+            "Accept-Ranges": "bytes",  # Tell client WE support ranges
         }
 
-        if file_size:
-            headers["Content-Length"]=file_size
+        # Handle range response from source
+        if r.status_code == 206:
+            status_code = 206
+            response_headers["Content-Range"] = r.headers.get("Content-Range")
+            response_headers["Content-Length"] = r.headers.get("Content-Length")
+        else:
+            # Full content
+            if source_content_length:
+                response_headers["Content-Length"] = source_content_length
+
+        # Content-Disposition
+        disposition = (
+            f'attachment; filename="{filename}"'
+            if mode == "download"
+            else f'inline; filename="{filename}"'
+        )
+        response_headers["Content-Disposition"] = disposition
+
+        # ETag for cache validation (helps resume)
+        etag = source_etag or generate_etag(video_url)
+        response_headers["ETag"] = f'"{etag}"'
+        
+        if source_last_modified:
+            response_headers["Last-Modified"] = source_last_modified
+
+        # Check If-None-Match for 304 responses
+        if_none_match = request.headers.get("If-None-Match")
+        if if_none_match and if_none_match == f'"{etag}"':
+            return Response(status=304)
+
+        # Stream generator with larger chunks for speed
+        def generate():
+            chunk_size = 262144  # 256KB chunks for faster transfer
+            try:
+                for chunk in r.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        yield chunk
+            finally:
+                r.close()
 
         return Response(
-            r.iter_content(chunk_size=65536),
-            headers=headers
+            generate(),
+            status=status_code,
+            headers=response_headers,
+            direct_passthrough=True
         )
 
     except Exception as e:
+        print("Serve file error:", e)
         return jsonify({"success":False,"message":str(e)}),500
 
 # ===== STATS =====
