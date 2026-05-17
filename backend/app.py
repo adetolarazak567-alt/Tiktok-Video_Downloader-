@@ -6,10 +6,8 @@ import string
 import re
 import sqlite3
 import concurrent.futures
-import hashlib
 from dotenv import load_dotenv
 import os
-import json
 
 load_dotenv()
 
@@ -25,27 +23,18 @@ session = requests.Session()
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-})
+session.headers.update({"User-Agent": "Mozilla/5.0"})
 
 retry = Retry(
     total=3,
-    backoff_factor=0.5,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["HEAD", "GET", "POST", "OPTIONS"]
+    backoff_factor=0.2,
+    status_forcelist=[429, 500, 502, 503, 504]
 )
 
 adapter = HTTPAdapter(
     max_retries=retry,
-    pool_connections=100,
-    pool_maxsize=100,
-    pool_block=False
+    pool_connections=1000,
+    pool_maxsize=1000
 )
 
 session.mount("http://", adapter)
@@ -76,14 +65,7 @@ CREATE TABLE IF NOT EXISTS unique_ips (
 c.execute('''
 CREATE TABLE IF NOT EXISTS video_cache (
     url TEXT PRIMARY KEY,
-    video_url TEXT,
-    title TEXT,
-    author TEXT,
-    thumbnail TEXT,
-    content_length INTEGER,
-    etag TEXT,
-    last_modified TEXT,
-    created_at INTEGER
+    video_url TEXT
 )
 ''')
 
@@ -100,12 +82,9 @@ conn.commit()
 
 # ===== RAM CACHE =====
 cache = {}
-metadata_cache = {}
 
 # ===== HELPERS =====
 def clean_filename(text):
-    if not text:
-        text = "ToolifyX Downloader"
     text = re.sub(r'[\\/*?:"<>|]', "", text)
     text = re.sub(r'\s+', " ", text).strip()
     return text[:120]
@@ -113,324 +92,94 @@ def clean_filename(text):
 def random_string(length=6):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
-def generate_etag(url):
-    return hashlib.md5(url.encode()).hexdigest()[:16]
-
 # ===== EXPAND SHORT TIKTOK LINKS =====
 def expand_url(url):
     try:
-        if any(x in url for x in ["vt.tiktok.com", "vm.tiktok.com", "t.tiktok.com", "tiktok.com/t/"]):
-            r = session.head(url, allow_redirects=True, timeout=10)
+        if "vt.tiktok.com" in url or "vm.tiktok.com" in url:
+            r = session.head(url, allow_redirects=True, timeout=5)
             return r.url
-    except Exception as e:
-        print("Expand URL error:", e)
+    except:
+        pass
     return url
 
-# ===== TIKTOK METADATA EXTRACTION =====
-def extract_video_id(url):
-    patterns = [
-        r'tiktok\.com/@[\w.]+/video/(\d+)',
-        r'tiktok\.com/t/(\w+)',
-        r'vm\.tiktok\.com/\w+',
-        r'vt\.tiktok\.com/\w+',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    return None
-
-def fetch_tiktok_metadata(url):
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        }
-        
-        r = session.get(url, headers=headers, timeout=10, allow_redirects=True)
-        
-        if r.status_code != 200:
-            return None
-            
-        html = r.text
-        
-        json_ld_match = re.search(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', html, re.DOTALL)
-        if json_ld_match:
-            try:
-                data = json.loads(json_ld_match.group(1))
-                if isinstance(data, dict):
-                    return {
-                        "title": data.get("name", data.get("description", ""))[:200],
-                        "author": data.get("author", {}).get("name", "")[:100] if isinstance(data.get("author"), dict) else "",
-                        "thumbnail": data.get("thumbnailUrl", data.get("image", "")),
-                    }
-            except json.JSONDecodeError:
-                pass
-        
-        title_match = re.search(r'<meta[^>]*property="og:title"[^>]*content="([^"]*)"', html)
-        desc_match = re.search(r'<meta[^>]*property="og:description"[^>]*content="([^"]*)"', html)
-        author_match = re.search(r'<meta[^>]*property="og:author"[^>]*content="([^"]*)"', html)
-        thumb_match = re.search(r'<meta[^>]*property="og:image"[^>]*content="([^"]*)"', html)
-        
-        title = title_match.group(1) if title_match else (desc_match.group(1) if desc_match else "")
-        author = author_match.group(1) if author_match else ""
-        thumbnail = thumb_match.group(1) if thumb_match else ""
-        
-        title = re.sub(r' on TikTok$', '', title)
-        title = re.sub(r' \| TikTok$', '', title)
-        
-        if title or author:
-            return {
-                "title": title[:200],
-                "author": author[:100],
-                "thumbnail": thumbnail,
-            }
-            
-    except Exception as e:
-        print("Metadata fetch error:", e)
-    
-    return None
-
-# ===== WORKING API FETCHERS (Multiple fallbacks) =====
-
-def fetch_ssstik(url):
-    """SSSTik.io API - widely reliable"""
+# ===== API FETCHERS =====
+def fetch_tikwm(url):
     try:
         res = session.post(
-            "https://ssstik.io/abc?url=dl",
-            data={"id": url, "locale": "en", "tt": "0"},
-            timeout=10,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Origin": "https://ssstik.io",
-                "Referer": "https://ssstik.io/en",
-            }
+            "https://www.tikwm.com/api/",
+            data={"url": url, "hd": "1"},
+            timeout=5
         )
         if res.status_code == 200:
-            html = res.text
-            # Extract download link from HTML
-            video_match = re.search(r'href="(https://[^"]*\.mp4[^"]*)"', html)
-            if video_match:
-                return {
-                    "video_url": video_match.group(1),
-                    "title": "",
-                    "author": "",
-                    "thumbnail": "",
-                }
-    except Exception as e:
-        print("ssstik error:", e)
+            video = res.json().get("data", {}).get("play")
+            if video:
+                return video
+    except:
+        pass
     return None
 
 
-def fetch_snaptik(url):
-    """SnapTik.app API"""
+def fetch_tikwm_alt(url):
     try:
         res = session.post(
-            "https://snaptik.app/abc2.php",
+            "https://tikwm.com/api/",
             data={"url": url},
-            timeout=10,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Origin": "https://snaptik.app",
-                "Referer": "https://snaptik.app/",
-            }
+            timeout=5
         )
         if res.status_code == 200:
-            data = res.json()
-            video_url = data.get("url") or data.get("link")
-            if video_url:
-                return {
-                    "video_url": video_url,
-                    "title": data.get("title", ""),
-                    "author": data.get("author", ""),
-                    "thumbnail": data.get("cover", ""),
-                }
-    except Exception as e:
-        print("snaptik error:", e)
+            video = res.json().get("data", {}).get("play")
+            if video:
+                return video
+    except:
+        pass
     return None
 
 
-def fetch_tikmate(url):
-    """TikMate API"""
+def fetch_backup(url):
     try:
         res = session.post(
-            "https://tikmate.app/api/lookup",
+            "https://api2.musicaldown.com/v2/download",
             data={"url": url},
-            timeout=10,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Origin": "https://tikmate.app",
-                "Referer": "https://tikmate.app/",
-            }
+            timeout=6
         )
         if res.status_code == 200:
             data = res.json()
-            video_url = data.get("videoUrl") or data.get("video_url")
+            video_url = data.get("video", {}).get("no_watermark")
             if video_url:
-                return {
-                    "video_url": video_url,
-                    "title": data.get("title", ""),
-                    "author": data.get("author", ""),
-                    "thumbnail": data.get("thumbnail", ""),
-                }
-    except Exception as e:
-        print("tikmate error:", e)
+                return video_url
+    except:
+        pass
     return None
 
-
-def fetch_savettok(url):
-    """Savettok.org API"""
-    try:
-        res = session.post(
-            "https://savettok.org/api/download",
-            json={"url": url},
-            timeout=10,
-            headers={
-                "Content-Type": "application/json",
-                "Origin": "https://savettok.org",
-                "Referer": "https://savettok.org/",
-            }
-        )
-        if res.status_code == 200:
-            data = res.json()
-            video_url = data.get("video_url") or data.get("url")
-            if video_url:
-                return {
-                    "video_url": video_url,
-                    "title": data.get("title", ""),
-                    "author": data.get("author", ""),
-                    "thumbnail": data.get("thumbnail", ""),
-                }
-    except Exception as e:
-        print("savettok error:", e)
-    return None
-
-
-def fetch_tikdown(url):
-    """TikDown API"""
-    try:
-        res = session.post(
-            "https://tikdown.org/getVideo",
-            data={"url": url},
-            timeout=10,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Origin": "https://tikdown.org",
-                "Referer": "https://tikdown.org/",
-            }
-        )
-        if res.status_code == 200:
-            data = res.json()
-            video_url = data.get("video") or data.get("videoUrl")
-            if video_url:
-                return {
-                    "video_url": video_url,
-                    "title": data.get("title", ""),
-                    "author": data.get("author", ""),
-                    "thumbnail": data.get("thumbnail", ""),
-                }
-    except Exception as e:
-        print("tikdown error:", e)
-    return None
-
-
-def fetch_rapidapi(url):
-    """RapidAPI TikTok downloader (requires API key)"""
-    api_key = os.getenv("RAPIDAPI_KEY")
-    if not api_key:
-        return None
-    
-    try:
-        res = session.get(
-            "https://tiktok-video-no-watermark2.p.rapidapi.com/",
-            params={"url": url, "hd": "1"},
-            timeout=10,
-            headers={
-                "X-RapidAPI-Key": api_key,
-                "X-RapidAPI-Host": "tiktok-video-no-watermark2.p.rapidapi.com",
-            }
-        )
-        if res.status_code == 200:
-            data = res.json()
-            video_url = data.get("data", {}).get("play") or data.get("video")
-            if video_url:
-                return {
-                    "video_url": video_url,
-                    "title": data.get("data", {}).get("title", ""),
-                    "author": data.get("data", {}).get("author", {}).get("nickname", ""),
-                    "thumbnail": data.get("data", {}).get("cover", ""),
-                }
-    except Exception as e:
-        print("rapidapi error:", e)
-    return None
-
-# ===== PARALLEL FETCH (5+ APIs) =====
+# ===== PARALLEL FETCH (ULTRA FAST) =====
 def fetch_tiktok_video(url):
+
     url = expand_url(url)
-    metadata = None
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+
         futures = [
-            executor.submit(fetch_ssstik, url),
-            executor.submit(fetch_snaptik, url),
-            executor.submit(fetch_tikmate, url),
-            executor.submit(fetch_savettok, url),
-            executor.submit(fetch_tikdown, url),
-            executor.submit(fetch_rapidapi, url),
+            executor.submit(fetch_tikwm, url),
+            executor.submit(fetch_tikwm_alt, url),
+            executor.submit(fetch_backup, url)
         ]
-        
-        meta_future = executor.submit(fetch_tiktok_metadata, url)
-        
-        video_result = None
+
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
-            if result and result.get("video_url"):
-                video_result = result
-                break
-        
-        try:
-            metadata = meta_future.result(timeout=5)
-        except:
-            pass
-    
-    if video_result and metadata:
-        if not video_result.get("title") and metadata.get("title"):
-            video_result["title"] = metadata["title"]
-        if not video_result.get("author") and metadata.get("author"):
-            video_result["author"] = metadata["author"]
-        if not video_result.get("thumbnail") and metadata.get("thumbnail"):
-            video_result["thumbnail"] = metadata["thumbnail"]
-    
-    return video_result
+            if result:
+                return result
 
-# ===== PROBE VIDEO HEADERS =====
-def probe_video_headers(video_url):
-    try:
-        r = session.head(video_url, timeout=10, allow_redirects=True)
-        if r.status_code in (200, 206):
-            return {
-                "content_length": r.headers.get("Content-Length"),
-                "etag": r.headers.get("ETag"),
-                "last_modified": r.headers.get("Last-Modified"),
-                "accept_ranges": r.headers.get("Accept-Ranges"),
-                "content_type": r.headers.get("Content-Type", "video/mp4"),
-            }
-    except Exception as e:
-        print("Probe error:", e)
-    return {}
+    return None
 
 # ===== SAVE CACHE =====
-def save_cache_db(url, video_url, title="", author="", thumbnail="", content_length=None, etag=None, last_modified=None):
+def save_cache_db(url, video_url):
     try:
         conn2 = sqlite3.connect("stats.db")
         c2 = conn2.cursor()
 
         c2.execute(
-            """INSERT OR REPLACE INTO video_cache 
-               (url, video_url, title, author, thumbnail, content_length, etag, last_modified, created_at) 
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (url, video_url, title, author, thumbnail, content_length, etag, last_modified, int(time.time()))
+            "INSERT OR IGNORE INTO video_cache (url,video_url) VALUES (?,?)",
+            (url,video_url)
         )
 
         conn2.commit()
@@ -461,85 +210,46 @@ def download_video():
 
         # RAM cache
         if url in cache:
-            cached = cache[url]
-            meta = metadata_cache.get(url, {})
-            
-            base_name = meta.get("title", "ToolifyX Downloader") or "ToolifyX Downloader"
-            if meta.get("author"):
-                base_name = f"{meta['author']} - {base_name}"
-            
-            filename = clean_filename(base_name)+"_"+random_string()+".mp4"
+
+            filename = clean_filename("ToolifyX Downloader")+"_"+random_string()+".mp4"
 
             return jsonify({
                 "success": True,
-                "url": cached,
-                "filename": filename,
-                "title": meta.get("title", ""),
-                "author": meta.get("author", ""),
-                "thumbnail": meta.get("thumbnail", ""),
-                "cached": True
+                "url": cache[url],
+                "filename": filename
             })
 
         # DB cache
-        c.execute("SELECT video_url, title, author, thumbnail, content_length, etag, last_modified FROM video_cache WHERE url=?",(url,))
+        c.execute("SELECT video_url FROM video_cache WHERE url=?",(url,))
         row = c.fetchone()
 
         if row:
-            video_url, db_title, db_author, db_thumbnail, db_cl, db_etag, db_lm = row
+            video_url = row[0]
             cache[url] = video_url
-            metadata_cache[url] = {
-                "title": db_title or "",
-                "author": db_author or "",
-                "thumbnail": db_thumbnail or ""
-            }
 
-            base_name = db_title or "ToolifyX Downloader"
-            if db_author:
-                base_name = f"{db_author} - {base_name}"
-            
-            filename = clean_filename(base_name)+"_"+random_string()+".mp4"
+            filename = clean_filename("ToolifyX Downloader")+"_"+random_string()+".mp4"
 
             return jsonify({
                 "success": True,
                 "url": video_url,
-                "filename": filename,
-                "title": db_title or "",
-                "author": db_author or "",
-                "thumbnail": db_thumbnail or "",
-                "cached": True
+                "filename": filename
             })
 
         # Fetch
-        result = fetch_tiktok_video(url)
+        video_url = fetch_tiktok_video(url)
 
-        print("FETCH RESULT:", result)
+        print("FETCH RESULT:",video_url)
 
-        if not result or not result.get("video_url"):
-            return jsonify({"success":False,"message":"Fetch failed - all APIs unavailable"}),500
-
-        video_url = result["video_url"]
-        title = result.get("title", "")
-        author = result.get("author", "")
-        thumbnail = result.get("thumbnail", "")
-
-        # Probe video headers for resume support
-        headers_info = probe_video_headers(video_url)
-        content_length = headers_info.get("content_length")
-        etag = headers_info.get("etag")
-        last_modified = headers_info.get("last_modified")
+        if not video_url:
+            return jsonify({"success":False,"message":"Fetch failed"}),500
 
         # RAM cache
         cache[url] = video_url
-        metadata_cache[url] = {
-            "title": title,
-            "author": author,
-            "thumbnail": thumbnail
-        }
 
-        # Save DB async with header info
+        # Save DB async
         threading.Thread(
             target=save_cache_db,
-            args=(url, video_url, title, author, thumbnail, content_length, etag, last_modified),
+            args=(url,video_url),
             daemon=True
         ).start()
 
@@ -555,20 +265,12 @@ def download_video():
         except:
             pass
 
-        base_name = title or "ToolifyX Downloader"
-        if author:
-            base_name = f"{author} - {base_name}"
-        
-        filename = clean_filename(base_name)+"_"+random_string()+".mp4"
+        filename = clean_filename("ToolifyX Downloader")+"_"+random_string()+".mp4"
 
         return jsonify({
             "success":True,
             "url":video_url,
-            "filename":filename,
-            "title": title,
-            "author": author,
-            "thumbnail": thumbnail,
-            "cached": False
+            "filename":filename
         })
 
     except Exception as e:
@@ -579,104 +281,69 @@ def download_video():
             "message":"Server recovered automatically"
         }),500
 
-# ===== RESUMABLE FILE SERVING =====
+# ===== FILE SERVING (RESUMABLE) =====
 @app.route("/file")
 def serve_file():
 
     video_url = request.args.get("url")
     mode = request.args.get("mode","preview")
-    custom_filename = request.args.get("filename", "")
 
     if not video_url:
         return jsonify({"success":False,"message":"No video URL"}),400
 
     try:
-        # Probe source for range support
-        head_resp = session.head(video_url, timeout=10, allow_redirects=True)
-        source_supports_range = head_resp.headers.get("Accept-Ranges") == "bytes"
-        source_content_length = head_resp.headers.get("Content-Length")
-        source_etag = head_resp.headers.get("ETag")
-        source_last_modified = head_resp.headers.get("Last-Modified")
-
-        # Parse Range header from client
+        # Parse Range header from client (e.g., "bytes=0-1023" or "bytes=1024-")
         range_header = request.headers.get("Range")
-        
-        rand = random_string()
-        if custom_filename:
-            filename = clean_filename(custom_filename)
-            if not filename.endswith(".mp4"):
-                filename += ".mp4"
-        else:
-            filename = f"ToolifyX Downloader-{rand}.mp4"
 
-        # Build request to source
+        # Build request headers to forward to source
         source_headers = {}
-        if range_header and source_supports_range:
+        if range_header:
             source_headers["Range"] = range_header
 
-        # Stream from source with range support
-        r = session.get(
-            video_url, 
-            stream=True, 
-            timeout=30,
-            headers=source_headers
-        )
+        # Request from source with range support
+        r = session.get(video_url, stream=True, timeout=15, headers=source_headers)
 
-        # Determine response status and headers
-        status_code = 200
-        response_headers = {
+        rand = random_string()
+        filename = f"ToolifyX Downloader-{rand}.mp4"
+
+        # Determine response status
+        status_code = 206 if r.status_code == 206 else 200
+
+        # Build response headers
+        headers = {
             "Content-Type": r.headers.get("Content-Type", "video/mp4"),
-            "Accept-Ranges": "bytes",
+            "Accept-Ranges": "bytes",  # Tell client we support resume
         }
 
-        # Handle range response from source
-        if r.status_code == 206:
-            status_code = 206
-            response_headers["Content-Range"] = r.headers.get("Content-Range")
-            response_headers["Content-Length"] = r.headers.get("Content-Length")
-        else:
-            if source_content_length:
-                response_headers["Content-Length"] = source_content_length
+        # Forward Content-Range if source sent it (partial content)
+        if "Content-Range" in r.headers:
+            headers["Content-Range"] = r.headers["Content-Range"]
+
+        # Forward Content-Length (either full or partial)
+        if "Content-Length" in r.headers:
+            headers["Content-Length"] = r.headers["Content-Length"]
 
         # Content-Disposition
         disposition = (
             f'attachment; filename="{filename}"'
-            if mode == "download"
+            if mode=="download"
             else f'inline; filename="{filename}"'
         )
-        response_headers["Content-Disposition"] = disposition
+        headers["Content-Disposition"] = disposition
 
-        # ETag for cache validation
-        etag = source_etag or generate_etag(video_url)
-        response_headers["ETag"] = f'"{etag}"'
-        
-        if source_last_modified:
-            response_headers["Last-Modified"] = source_last_modified
-
-        # Check If-None-Match for 304 responses
-        if_none_match = request.headers.get("If-None-Match")
-        if if_none_match and if_none_match == f'"{etag}"':
-            return Response(status=304)
-
-        # Stream generator with larger chunks for speed
+        # Stream generator
         def generate():
-            chunk_size = 262144  # 256KB chunks
-            try:
-                for chunk in r.iter_content(chunk_size=chunk_size):
-                    if chunk:
-                        yield chunk
-            finally:
-                r.close()
+            for chunk in r.iter_content(chunk_size=65536):
+                if chunk:
+                    yield chunk
 
         return Response(
             generate(),
             status=status_code,
-            headers=response_headers,
-            direct_passthrough=True
+            headers=headers
         )
 
     except Exception as e:
-        print("Serve file error:", e)
         return jsonify({"success":False,"message":str(e)}),500
 
 # ===== STATS =====
