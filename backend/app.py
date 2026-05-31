@@ -111,9 +111,15 @@ def fetch_tikwm(url):
             timeout=5
         )
         if res.status_code == 200:
-            video = res.json().get("data", {}).get("play")
+            data = res.json().get("data", {})
+            video = data.get("play")
             if video:
-                return video
+                return {
+                    "video_url": video,
+                    "title": data.get("title", ""),
+                    "author": data.get("author", {}).get("nickname", "") or data.get("author", {}).get("unique_id", ""),
+                    "thumbnail": data.get("cover", "")
+                }
     except:
         pass
     return None
@@ -127,9 +133,15 @@ def fetch_tikwm_alt(url):
             timeout=5
         )
         if res.status_code == 200:
-            video = res.json().get("data", {}).get("play")
+            data = res.json().get("data", {})
+            video = data.get("play")
             if video:
-                return video
+                return {
+                    "video_url": video,
+                    "title": data.get("title", ""),
+                    "author": data.get("author", {}).get("nickname", "") or data.get("author", {}).get("unique_id", ""),
+                    "thumbnail": data.get("cover", "")
+                }
     except:
         pass
     return None
@@ -146,7 +158,12 @@ def fetch_backup(url):
             data = res.json()
             video_url = data.get("video", {}).get("no_watermark")
             if video_url:
-                return video_url
+                return {
+                    "video_url": video_url,
+                    "title": data.get("title", ""),
+                    "author": data.get("author", ""),
+                    "thumbnail": data.get("thumbnail", "")
+                }
     except:
         pass
     return None
@@ -167,6 +184,7 @@ def fetch_tiktok_video(url):
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
             if result:
+                result["original_url"] = url
                 return result
 
     return None
@@ -178,7 +196,7 @@ def save_cache_db(url, video_url):
         c2 = conn2.cursor()
 
         c2.execute(
-            "INSERT OR IGNORE INTO video_cache (url,video_url) VALUES (?,?)",
+            "INSERT OR REPLACE INTO video_cache (url,video_url) VALUES (?,?)",
             (url,video_url)
         )
 
@@ -208,45 +226,22 @@ def download_video():
         except:
             pass
 
-        # RAM cache
-        if url in cache:
+        # Fetch fresh data every time (no cache to avoid expired URLs)
+        result = fetch_tiktok_video(url)
 
-            filename = clean_filename("ToolifyX Downloader")+"_"+random_string()+".mp4"
+        print("FETCH RESULT:",result)
 
-            return jsonify({
-                "success": True,
-                "url": cache[url],
-                "filename": filename
-            })
-
-        # DB cache
-        c.execute("SELECT video_url FROM video_cache WHERE url=?",(url,))
-        row = c.fetchone()
-
-        if row:
-            video_url = row[0]
-            cache[url] = video_url
-
-            filename = clean_filename("ToolifyX Downloader")+"_"+random_string()+".mp4"
-
-            return jsonify({
-                "success": True,
-                "url": video_url,
-                "filename": filename
-            })
-
-        # Fetch
-        video_url = fetch_tiktok_video(url)
-
-        print("FETCH RESULT:",video_url)
-
-        if not video_url:
+        if not result:
             return jsonify({"success":False,"message":"Fetch failed"}),500
 
-        # RAM cache
-        cache[url] = video_url
+        video_url = result["video_url"]
+        title = result.get("title", "")
+        author = result.get("author", "")
+        thumbnail = result.get("thumbnail", "")
+        original_url = result.get("original_url", url)
 
-        # Save DB async
+        # Save to cache (for reference, but we re-fetch on /file)
+        cache[url] = video_url
         threading.Thread(
             target=save_cache_db,
             args=(url,video_url),
@@ -265,12 +260,16 @@ def download_video():
         except:
             pass
 
-        filename = clean_filename("ToolifyX Downloader")+"_"+random_string()+".mp4"
+        filename = clean_filename(title or "ToolifyX Downloader")+"_"+random_string()+".mp4"
 
         return jsonify({
             "success":True,
             "url":video_url,
-            "filename":filename
+            "filename":filename,
+            "title":title,
+            "author":author,
+            "thumbnail":thumbnail,
+            "videoId": url
         })
 
     except Exception as e:
@@ -281,12 +280,22 @@ def download_video():
             "message":"Server recovered automatically"
         }),500
 
-# ===== FILE SERVING (RESUMABLE) =====
+# ===== FILE SERVING (RE-FETCH FRESH URL) =====
 @app.route("/file")
 def serve_file():
 
+    # Support both old "url" param and new "videoId" param
     video_url = request.args.get("url")
+    video_id = request.args.get("videoId")
     mode = request.args.get("mode","preview")
+
+    # If videoId provided, re-fetch fresh URL
+    if video_id and not video_url:
+        result = fetch_tiktok_video(video_id)
+        if result:
+            video_url = result["video_url"]
+        else:
+            return jsonify({"success":False,"message":"Could not re-fetch video. Link may be expired or invalid."}),500
 
     if not video_url:
         return jsonify({"success":False,"message":"No video URL"}),400
