@@ -6,7 +6,6 @@ import string
 import re
 import sqlite3
 import concurrent.futures
-import subprocess
 import json
 import os
 from dotenv import load_dotenv
@@ -29,19 +28,20 @@ session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
 })
 
-retry = Retry(
-    total=3,
-    backoff_factor=0.2,
-    status_forcelist=[429, 500, 502, 503, 504]
-)
+retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
 
-adapter = HTTPAdapter(
-    max_retries=retry,
-    pool_connections=100,
-    pool_maxsize=100
-)
+adapter = HTTPAdapter(max_retries=retry, pool_connections=100, pool_maxsize=100)
 
 session.mount("http://", adapter)
 session.mount("https://", adapter)
@@ -50,75 +50,62 @@ session.mount("https://", adapter)
 thread_local = threading.local()
 
 def get_db():
-    """Create a new connection per thread — NEVER share across threads"""
     if not hasattr(thread_local, 'conn') or thread_local.conn is None:
         thread_local.conn = sqlite3.connect("stats.db", check_same_thread=False)
     return thread_local.conn
 
 def init_db():
-    """Initialize database tables"""
     conn = sqlite3.connect("stats.db")
     c = conn.cursor()
-
-    c.execute('''
+    
+    c.execute("""
     CREATE TABLE IF NOT EXISTS stats (
         key TEXT PRIMARY KEY,
         value INTEGER
     )
-    ''')
-
-    for key in ["requests", "downloads", "cache_hits", "videos_served", "yt_dlp_fails", "api_fails"]:
+    """)
+    
+    for key in ["requests", "downloads", "cache_hits", "videos_served", 
+                "yt_dlp_success", "yt_dlp_fail", "scrape_success", "scrape_fail",
+                "api_success", "api_fail"]:
         c.execute("INSERT OR IGNORE INTO stats (key,value) VALUES (?,?)", (key, 0))
-
-    c.execute('''
-    CREATE TABLE IF NOT EXISTS unique_ips (
-        ip TEXT PRIMARY KEY
-    )
-    ''')
-
-    c.execute('''
+    
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS unique_ips (ip TEXT PRIMARY KEY)
+    """)
+    
+    c.execute("""
     CREATE TABLE IF NOT EXISTS video_cache (
         url TEXT PRIMARY KEY,
-        video_url TEXT,
-        title TEXT,
-        author TEXT,
-        thumbnail TEXT,
-        created_at INTEGER
+        video_url TEXT, title TEXT, author TEXT, thumbnail TEXT, created_at INTEGER
     )
-    ''')
-
-    c.execute('''
+    """)
+    
+    c.execute("""
     CREATE TABLE IF NOT EXISTS download_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ip TEXT,
-        url TEXT,
-        timestamp INTEGER,
-        source TEXT,
-        success INTEGER
+        ip TEXT, url TEXT, timestamp INTEGER, source TEXT, success INTEGER
     )
-    ''')
-
+    """)
+    
     conn.commit()
     conn.close()
 
 init_db()
 
-# ===== RAM CACHE =====
 cache = {}
 
-# ===== HELPERS =====
 def clean_filename(text):
     if not text:
         return "video"
     text = re.sub(r'[\\/*?:"<>|]', "", text)
-    text = re.sub(r'\s+', " ", text).strip()
+    text = re.sub(r'[ \t\n\r]+', " ", text).strip()
     return text[:120]
 
 def random_string(length=6):
-    return '''.join(random.choices(string.ascii_letters + string.digits, k=length))
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
 def expand_url(url):
-    """Expand short TikTok links"""
     try:
         if any(x in url for x in ["vt.tiktok.com", "vm.tiktok.com", "t.tiktok.com"]):
             r = session.head(url, allow_redirects=True, timeout=5)
@@ -127,8 +114,15 @@ def expand_url(url):
         print(f"Expand error: {e}")
     return url
 
+def extract_video_id(url):
+    patterns = [r'/video/(\d+)', r'/v/(\d+)', r'video/(\d+)']
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
 def update_stats(key, ip=None, url=None, source=None, success=1):
-    """Thread-safe stats update"""
     try:
         conn = get_db()
         c = conn.cursor()
@@ -145,7 +139,6 @@ def update_stats(key, ip=None, url=None, source=None, success=1):
         print(f"Stats update error: {e}")
 
 def save_cache_db(url, result):
-    """Thread-safe cache save"""
     try:
         conn = sqlite3.connect("stats.db")
         c = conn.cursor()
@@ -161,58 +154,40 @@ def save_cache_db(url, result):
     except Exception as e:
         print(f"DB cache save error: {e}")
 
+
 # ============================================================================
-# METHOD 1: yt-dlp (MOST RELIABLE - Install on your server)
-# ============================================================================
-# Install: pip install yt-dlp
-# This is the ONLY consistently working method in 2026
+# METHOD 1: yt-dlp (PRIMARY - Most Reliable, Completely Free)
 # ============================================================================
 
 def fetch_yt_dlp(url):
-    """
-    Use yt-dlp to extract TikTok video info.
-    This is the MOST RELIABLE method. Install yt-dlp on your server.
-    """
     try:
         import yt_dlp
-
+        
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
-            'cookiesfrombrowser': None,  # Don't use browser cookies
             'nocheckcertificate': True,
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'referer': 'https://www.tiktok.com/',
-            'headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-            }
+            'cookiefile': None,
+            'cookiesfrombrowser': None,
         }
-
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-
-            # Find best format (video + audio)
+            
             formats = info.get('formats', [])
             best_url = None
-
-            # Prefer format with both video and audio
+            
             for fmt in formats:
                 if fmt.get('vcodec') != 'none' and fmt.get('acodec') != 'none':
                     best_url = fmt.get('url')
                     break
-
-            # Fallback: any video format
+            
             if not best_url:
                 for fmt in formats:
                     if fmt.get('vcodec') != 'none':
                         best_url = fmt.get('url')
                         break
-
+            
             if best_url:
                 return {
                     "video_url": best_url,
@@ -222,181 +197,204 @@ def fetch_yt_dlp(url):
                     "duration": info.get('duration', 0),
                     "source": "yt-dlp"
                 }
-
+                
     except ImportError:
-        print("yt-dlp not installed. Run: pip install yt-dlp")
+        print("[yt-dlp] Not installed. Run: pip install yt-dlp")
     except Exception as e:
-        print(f"yt-dlp error: {e}")
-        update_stats("yt_dlp_fails")
-
+        print(f"[yt-dlp] Error: {e}")
+    
     return None
 
 
 # ============================================================================
-# METHOD 2: Paid API Fallbacks (If yt-dlp fails or not installed)
-# ============================================================================
-# Sign up for one of these and add your API key to .env:
-# - RapidAPI TikTok Downloader (~$10-20/month)
-# - ScrapeBadger (pay-per-use, ~$0.005/request)
-# - Apify TikTok Downloader Actor
+# METHOD 2: Direct TikTok Scraping (FALLBACK - Free)
 # ============================================================================
 
-def fetch_rapidapi(url):
-    """
-    RapidAPI TikTok Downloader - requires API key
-    Sign up: https://rapidapi.com/LaurynProsacco58/api/tiktok-video-downloader-api-no-watermark
-    """
-    api_key = os.getenv("RAPIDAPI_KEY")
-    if not api_key:
+def fetch_tiktok_api_direct(url):
+    video_id = extract_video_id(url)
+    if not video_id:
+        print("[Direct] Could not extract video ID")
         return None
-
+    
     try:
-        headers = {
-            "x-rapidapi-key": api_key,
-            "x-rapidapi-host": "tiktok-video-downloader-api-no-watermark.p.rapidapi.com"
+        mobile_headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": "https://www.tiktok.com/",
         }
-
-        res = session.get(
-            "https://tiktok-video-downloader-api-no-watermark.p.rapidapi.com/media/download",
-            params={"url": url},
-            headers=headers,
-            timeout=15
-        )
-
+        
+        res = session.get(url, headers=mobile_headers, timeout=15, allow_redirects=True)
+        
         if res.status_code == 200:
-            data = res.json()
-            video_url = data.get("video", {}).get("noWatermark") or data.get("video_url")
-            if video_url:
-                return {
-                    "video_url": video_url,
-                    "title": data.get("title", "TikTok Video"),
-                    "author": data.get("author", "Unknown"),
-                    "thumbnail": data.get("thumbnail", ""),
-                    "source": "rapidapi"
-                }
-    except Exception as e:
-        print(f"RapidAPI error: {e}")
-
-    return None
-
-
-def fetch_scrapebadger(url):
-    """
-    ScrapeBadger TikTok API - requires API key
-    Sign up: https://scrapebadger.com
-    """
-    api_key = os.getenv("SCRAPEBADGER_KEY")
-    if not api_key:
-        return None
-
-    try:
-        # Extract video ID from URL
-        video_id_match = re.search(r'/video/(\d+)', url)
-        video_id = video_id_match.group(1) if video_id_match else None
-
-        if not video_id:
-            return None
-
-        res = session.get(
-            f"https://scrapebadger.com/v1/tiktok/videos/{video_id}",
-            headers={"x-api-key": api_key},
-            params={"region": "US"},
-            timeout=20
-        )
-
-        if res.status_code == 200:
-            data = res.json()
-            video_data = data.get("video", {})
-
-            # Get download URL from formats
-            formats = video_data.get("formats", [])
-            video_url = None
-            for fmt in formats:
-                if fmt.get("vcodec") != "none":
-                    video_url = fmt.get("url")
-                    break
-
-            if video_url:
-                author = video_data.get("author", {})
-                return {
-                    "video_url": video_url,
-                    "title": video_data.get("desc", "TikTok Video")[:200],
-                    "author": f"@{author.get('unique_id', 'unknown')}",
-                    "thumbnail": video_data.get("cover", ""),
-                    "source": "scrapebadger"
-                }
-    except Exception as e:
-        print(f"ScrapeBadger error: {e}")
-
-    return None
-
-
-# ============================================================================
-# METHOD 3: Direct scraping with requests (Last resort, often blocked)
-# ============================================================================
-
-def fetch_direct_scrape(url):
-    """
-    Direct TikTok page scraping - often blocked by Cloudflare/TikTok
-    This is a fallback that may work occasionally.
-    """
-    try:
-        res = session.get(url, timeout=15, allow_redirects=True)
-
-        if res.status_code == 200:
-            # Look for SSR data
-            data_match = re.search(r'<script id="SIGI_STATE" type="application/json">(.*?)</script>', res.text)
-            if data_match:
-                data = json.loads(data_match.group(1))
-
-                # Extract video info from SIGI_STATE
-                item_module = data.get("ItemModule", {})
-                if item_module:
-                    video_id = list(item_module.keys())[0]
-                    video_data = item_module[video_id]
-
-                    video_url = video_data.get("video", {}).get("playAddr")
-                    if video_url:
-                        # Clean up the URL
-                        if video_url.startswith("//"):
-                            video_url = "https:" + video_url
-
-                        author = video_data.get("author", "")
+            # Pattern 1: SIGI_STATE
+            sigi_match = re.search(r'<script id="SIGI_STATE" type="application/json">(.*?)</script>', res.text, re.DOTALL)
+            if sigi_match:
+                try:
+                    sigi_data = json.loads(sigi_match.group(1))
+                    item_module = sigi_data.get("ItemModule", {})
+                    if item_module:
+                        vid_data = list(item_module.values())[0]
+                        video_info = vid_data.get("video", {})
+                        play_addr = video_info.get("playAddr", "")
+                        
+                        if play_addr:
+                            if play_addr.startswith("//"):
+                                play_addr = "https:" + play_addr
+                            
+                            author_info = vid_data.get("author", "")
+                            return {
+                                "video_url": play_addr,
+                                "title": vid_data.get("desc", "TikTok Video")[:200],
+                                "author": f"@{author_info}" if author_info else "Unknown",
+                                "thumbnail": video_info.get("cover", ""),
+                                "source": "direct_scrape"
+                            }
+                except Exception as e:
+                    print(f"[Direct] SIGI parse error: {e}")
+            
+            # Pattern 2: __UNIVERSAL_DATA_FOR_REHYDRATION__
+            universal_match = re.search(r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">(.*?)</script>', res.text, re.DOTALL)
+            if universal_match:
+                try:
+                    uni_data = json.loads(universal_match.group(1))
+                    
+                    def find_video_data(obj):
+                        if isinstance(obj, dict):
+                            if "video" in obj and isinstance(obj["video"], dict):
+                                video_obj = obj["video"]
+                                if "playAddr" in video_obj or "downloadAddr" in video_obj:
+                                    return video_obj
+                            for v in obj.values():
+                                result = find_video_data(v)
+                                if result:
+                                    return result
+                        elif isinstance(obj, list):
+                            for item in obj:
+                                result = find_video_data(item)
+                                if result:
+                                    return result
+                        return None
+                    
+                    video_obj = find_video_data(uni_data)
+                    if video_obj:
+                        play_addr = video_obj.get("playAddr", "") or video_obj.get("downloadAddr", "")
+                        if play_addr:
+                            if play_addr.startswith("//"):
+                                play_addr = "https:" + play_addr
+                            
+                            return {
+                                "video_url": play_addr,
+                                "title": "TikTok Video",
+                                "author": "Unknown",
+                                "thumbnail": video_obj.get("cover", ""),
+                                "source": "direct_scrape"
+                            }
+                except Exception as e:
+                    print(f"[Direct] Universal data parse error: {e}")
+            
+            # Pattern 3: Any script with video URL
+            script_matches = re.findall(r'<script[^>]*>(.*?)</script>', res.text, re.DOTALL)
+            for script in script_matches:
+                if "playAddr" in script or "downloadAddr" in script:
+                    url_match = re.search(r'(https?://[a-zA-Z0-9._/:-]+\.mp4[a-zA-Z0-9._/:-]*)', script)
+                    if url_match:
                         return {
-                            "video_url": video_url,
-                            "title": video_data.get("desc", "TikTok Video")[:200],
-                            "author": f"@{author}" if author else "Unknown",
-                            "thumbnail": video_data.get("cover", ""),
+                            "video_url": url_match.group(1),
+                            "title": "TikTok Video",
+                            "author": "Unknown",
+                            "thumbnail": "",
                             "source": "direct_scrape"
                         }
+        else:
+            print(f"[Direct] Page fetch failed: {res.status_code}")
+            
     except Exception as e:
-        print(f"Direct scrape error: {e}")
-
+        print(f"[Direct] Error: {e}")
+    
     return None
 
 
 # ============================================================================
-# MAIN FETCH LOGIC: Try methods in order of reliability
+# METHOD 3: Free Third-Party APIs (Last Resort - Often Broken)
+# ============================================================================
+
+def fetch_free_api_1(url):
+    try:
+        res = session.post(
+            "https://savetik.co/api/ajaxSearch",
+            data={"q": url, "lang": "en"},
+            timeout=15,
+            headers={
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": "https://savetik.co",
+                "Referer": "https://savetik.co/en"
+            }
+        )
+        
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("status") == "ok" and data.get("statusCode") == 200:
+                html = data.get("data", "")
+                video_match = re.search(r'href="(https?://[^"]+\.mp4[^"]*)"', html)
+                if video_match:
+                    return {
+                        "video_url": video_match.group(1).replace("&amp;", "&"),
+                        "title": "TikTok Video",
+                        "author": "Unknown",
+                        "thumbnail": "",
+                        "source": "savetik"
+                    }
+    except Exception as e:
+        print(f"[FreeAPI1] Error: {e}")
+    return None
+
+
+def fetch_free_api_2(url):
+    try:
+        res = session.post(
+            "https://ttsave.app/download",
+            json={"query": url},
+            timeout=15,
+            headers={
+                "Content-Type": "application/json",
+                "Origin": "https://ttsave.app",
+                "Referer": "https://ttsave.app/",
+                "X-Requested-With": "XMLHttpRequest"
+            }
+        )
+        
+        if res.status_code == 200:
+            video_match = re.search(r'href="(https?://[^"]+\.mp4[^"]*)"', res.text)
+            if video_match:
+                return {
+                    "video_url": video_match.group(1).replace("&amp;", "&"),
+                    "title": "TikTok Video",
+                    "author": "Unknown",
+                    "thumbnail": "",
+                    "source": "ttsave"
+                }
+    except Exception as e:
+        print(f"[FreeAPI2] Error: {e}")
+    return None
+
+
+# ============================================================================
+# MAIN FETCH LOGIC
 # ============================================================================
 
 def fetch_tiktok_video(url):
-    """
-    Fetch TikTok video using multiple methods in priority order:
-    1. yt-dlp (most reliable, requires installation)
-    2. Paid APIs (RapidAPI, ScrapeBadger)
-    3. Direct scraping (last resort)
-    """
     url = expand_url(url)
-    print(f"Fetching: {url}")
-
-    # Check RAM cache first (1 hour expiry)
+    print(f"\n[Fetch] Processing: {url}")
+    
+    # Check RAM cache (1 hour expiry)
     if url in cache:
         cached = cache[url]
         if time.time() - cached.get("timestamp", 0) < 3600:
-            print("RAM cache hit")
+            print("[Fetch] RAM cache hit")
             update_stats("cache_hits")
             return cached.get("data")
-
+    
     # Check DB cache (24 hour expiry)
     try:
         conn = get_db()
@@ -405,7 +403,7 @@ def fetch_tiktok_video(url):
                   (url, int(time.time()) - 86400))
         row = c.fetchone()
         if row:
-            print("DB cache hit")
+            print("[Fetch] DB cache hit")
             update_stats("cache_hits")
             return {
                 "video_url": row[0],
@@ -416,31 +414,31 @@ def fetch_tiktok_video(url):
                 "source": "cache"
             }
     except Exception as e:
-        print(f"Cache check error: {e}")
-
+        print(f"[Fetch] Cache check error: {e}")
+    
     # Try methods in order
     methods = [
-        ("yt-dlp", fetch_yt_dlp),
-        ("rapidapi", fetch_rapidapi),
-        ("scrapebadger", fetch_scrapebadger),
-        ("direct_scrape", fetch_direct_scrape),
+        ("yt-dlp", fetch_yt_dlp, "yt_dlp_success", "yt_dlp_fail"),
+        ("direct_scrape", fetch_tiktok_api_direct, "scrape_success", "scrape_fail"),
+        ("free_api_1", fetch_free_api_1, "api_success", "api_fail"),
+        ("free_api_2", fetch_free_api_2, "api_success", "api_fail"),
     ]
-
-    for name, method in methods:
-        print(f"Trying {name}...")
+    
+    for name, method, success_key, fail_key in methods:
+        print(f"[Fetch] Trying {name}...")
         result = method(url)
         if result:
             result["original_url"] = url
-            print(f"✅ SUCCESS via {name}")
-
-            # Save to caches
+            print(f"[Fetch] SUCCESS via {name}")
+            update_stats(success_key)
+            
             cache[url] = {"data": result, "timestamp": time.time()}
             threading.Thread(target=save_cache_db, args=(url, result), daemon=True).start()
-
+            
             return result
-        print(f"❌ {name} failed")
-
-    update_stats("api_fails")
+        print(f"[Fetch] {name} failed")
+        update_stats(fail_key)
+    
     return None
 
 
@@ -454,41 +452,37 @@ def download_video():
         data = request.get_json()
         url = data.get("url")
         ip = request.remote_addr or request.headers.get("X-Forwarded-For", "unknown")
-
+        
         if not url:
             return jsonify({"success": False, "message": "No URL provided"}), 400
-
-        # Validate URL
+        
         if "tiktok.com" not in url and "vt.tiktok.com" not in url and "vm.tiktok.com" not in url:
             return jsonify({"success": False, "message": "Invalid TikTok URL"}), 400
-
-        # Update stats
+        
         update_stats("requests", ip)
-
-        # Fetch video
+        
         result = fetch_tiktok_video(url)
-
-        print(f"FETCH RESULT: {result}")
-
+        
+        print(f"[Download] FETCH RESULT: {result is not None}")
+        
         if not result:
             return jsonify({
                 "success": False,
-                "message": "Unable to fetch video. All download methods failed. Please ensure yt-dlp is installed (pip install yt-dlp) or configure a paid API key."
+                "message": "Unable to fetch video. All methods failed. Please install yt-dlp: pip install yt-dlp"
             }), 503
-
+        
         video_url = result["video_url"]
         title = result.get("title", "")
         author = result.get("author", "")
         thumbnail = result.get("thumbnail", "")
         original_url = result.get("original_url", url)
         source = result.get("source", "unknown")
-
-        # Update success stats
+        
         update_stats("downloads", ip, url, source, 1)
         update_stats("videos_served")
-
+        
         filename = clean_filename(title or "ToolifyX Downloader") + "_" + random_string() + ".mp4"
-
+        
         return jsonify({
             "success": True,
             "url": video_url,
@@ -499,9 +493,9 @@ def download_video():
             "videoId": original_url,
             "source": source
         })
-
+        
     except Exception as e:
-        print(f"DOWNLOAD ERROR: {e}")
+        print(f"[Download] ERROR: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({
@@ -512,12 +506,10 @@ def download_video():
 
 @app.route("/file")
 def serve_file():
-    """Stream video file with range support"""
     video_url = request.args.get("url")
     video_id = request.args.get("videoId")
     mode = request.args.get("mode", "preview")
-
-    # Re-fetch fresh URL if videoId provided
+    
     if video_id and not video_url:
         result = fetch_tiktok_video(video_id)
         if result:
@@ -527,60 +519,57 @@ def serve_file():
                 "success": False,
                 "message": "Could not re-fetch video. Link may be expired or invalid."
             }), 500
-
+    
     if not video_url:
         return jsonify({"success": False, "message": "No video URL"}), 400
-
+    
     try:
-        # Parse Range header
         range_header = request.headers.get("Range")
         source_headers = {}
         if range_header:
             source_headers["Range"] = range_header
-
-        # Request from source
+        
         r = session.get(video_url, stream=True, timeout=20, headers=source_headers)
-
-        # Handle redirect if needed
+        
         if r.status_code in (301, 302, 307, 308) and r.headers.get("Location"):
             r = session.get(r.headers["Location"], stream=True, timeout=20, headers=source_headers)
-
+        
         status_code = 206 if r.status_code == 206 else (200 if r.status_code == 200 else r.status_code)
-
+        
         if status_code not in (200, 206):
             return jsonify({
                 "success": False,
                 "message": f"Source returned status {r.status_code}"
             }), 502
-
+        
         rand = random_string()
         filename = f"ToolifyX Downloader-{rand}.mp4"
-
+        
         headers = {
             "Content-Type": r.headers.get("Content-Type", "video/mp4"),
             "Accept-Ranges": "bytes",
         }
-
+        
         if "Content-Range" in r.headers:
             headers["Content-Range"] = r.headers["Content-Range"]
         if "Content-Length" in r.headers:
             headers["Content-Length"] = r.headers["Content-Length"]
-
+        
         disposition = (
-            f'attachment; filename="{filename}"' if mode == "download"
-            else f'inline; filename="{filename}"'
+            'attachment; filename="' + filename + '"' if mode == "download"
+            else 'inline; filename="' + filename + '"'
         )
         headers["Content-Disposition"] = disposition
-
+        
         def generate():
             for chunk in r.iter_content(chunk_size=65536):
                 if chunk:
                     yield chunk
-
+        
         return Response(generate(), status=status_code, headers=headers)
-
+        
     except Exception as e:
-        print(f"SERVE ERROR: {e}")
+        print(f"[Serve] ERROR: {e}")
         return jsonify({"success": False, "message": str(e)}), 500
 
 
@@ -589,26 +578,26 @@ def get_stats():
     try:
         conn = get_db()
         c = conn.cursor()
-
+        
         c.execute("SELECT key, value FROM stats")
         stats_data = dict(c.fetchall())
-
+        
         c.execute("SELECT COUNT(*) FROM unique_ips")
         unique_ips_count = c.fetchone()[0]
-
+        
         c.execute("SELECT ip, url, timestamp, source, success FROM download_logs ORDER BY timestamp DESC LIMIT 100")
         logs = [
             {"ip": ip, "url": url, "timestamp": ts, "source": src, "success": bool(succ)}
             for ip, url, ts, src, succ in c.fetchall()
         ]
-
+        
         return jsonify({
             **stats_data,
             "unique_ips": unique_ips_count,
             "download_logs": logs
         })
     except Exception as e:
-        print(f"STATS ERROR: {e}")
+        print(f"[Stats] ERROR: {e}")
         return jsonify({"success": False, "message": str(e)}), 500
 
 
@@ -621,24 +610,26 @@ def wake():
 def reset_stats():
     data = request.get_json()
     password = data.get("password")
-
+    
     if password != os.getenv("ADMIN_PASSWORD"):
         return jsonify({"success": False, "message": "Wrong password"}), 401
-
+    
     try:
         conn = get_db()
         c = conn.cursor()
-
-        for key in ["requests", "downloads", "cache_hits", "videos_served", "yt_dlp_fails", "api_fails"]:
+        
+        for key in ["requests", "downloads", "cache_hits", "videos_served",
+                    "yt_dlp_success", "yt_dlp_fail", "scrape_success", "scrape_fail",
+                    "api_success", "api_fail"]:
             c.execute("UPDATE stats SET value=0 WHERE key=?", (key,))
-
+        
         c.execute("DELETE FROM unique_ips")
         c.execute("DELETE FROM download_logs")
         c.execute("DELETE FROM video_cache")
-
+        
         conn.commit()
         cache.clear()
-
+        
         return jsonify({"success": True, "message": "All stats and caches reset"})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
@@ -646,19 +637,20 @@ def reset_stats():
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    """Check which download methods are available"""
     methods = {
         "yt_dlp": False,
-        "rapidapi": bool(os.getenv("RAPIDAPI_KEY")),
-        "scrapebadger": bool(os.getenv("SCRAPEBADGER_KEY")),
+        "yt_dlp_version": None,
+        "direct_scrape": True,
+        "free_apis": True,
     }
-
+    
     try:
         import yt_dlp
         methods["yt_dlp"] = True
+        methods["yt_dlp_version"] = yt_dlp.version.__version__
     except ImportError:
         pass
-
+    
     return jsonify({
         "success": True,
         "methods_available": methods,
